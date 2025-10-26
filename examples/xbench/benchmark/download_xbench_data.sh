@@ -35,23 +35,44 @@ echo ""
 echo "🔓 Step 3/4: Decrypting DeepSearch dataset..."
 echo "   This may take a moment..."
 
-# Use the standalone decryption script (Python 3.8+ compatible)
-python "$SCRIPT_DIR/decrypt_xbench.py" data/DeepSearch.csv data/DeepSearch_decrypted.csv
+echo "$SCRIPT_DIR"
+# Find and decrypt all DeepSearch CSV files
+DEEPSEARCH_FILES=($(find "$TEMP_DIR/data" -name "DeepSearch*.csv" ! -name "*_decrypted.csv" | sort))
+TOTAL_FILES=${#DEEPSEARCH_FILES[@]}
 
-echo "   ✅ Dataset decrypted"
+if [ $TOTAL_FILES -eq 0 ]; then
+    echo "   ⚠️  No DeepSearch files found!"
+else
+    echo "   📊 Found $TOTAL_FILES DeepSearch file(s) to decrypt"
+    
+    for i in "${!DEEPSEARCH_FILES[@]}"; do
+        FILE="${DEEPSEARCH_FILES[$i]}"
+        FILENAME=$(basename "$FILE")
+        OUTPUT_FILE="${FILE%.csv}_decrypted.csv"
+        
+        echo "   🔐 [$((i+1))/$TOTAL_FILES] Decrypting $FILENAME..."
+        python "$SCRIPT_DIR/decrypt_xbench.py" "$FILE" "$OUTPUT_FILE"
+    done
+    
+    echo "   ✅ All datasets decrypted"
+fi
 echo ""
 
 # Step 4: Copy to benchmark directory
 echo "📋 Step 4/4: Copying decrypted dataset..."
-if [ -f "data/DeepSearch_decrypted.csv" ]; then
-    cp data/DeepSearch_decrypted.csv "$SCRIPT_DIR/"
-    echo "   ✅ DeepSearch_decrypted.csv copied"
-fi
+DECRYPTED_FILES=($(find "$TEMP_DIR/data" -name "DeepSearch*_decrypted.csv" | sort))
+COPIED_COUNT=0
 
-# Also copy original file if decryption created it in place
-if [ -f "data/DeepSearch.csv" ]; then
-    cp data/DeepSearch.csv "$SCRIPT_DIR/DeepSearch_original.csv"
-    echo "   ✅ DeepSearch.csv (original) copied"
+if [ ${#DECRYPTED_FILES[@]} -eq 0 ]; then
+    echo "   ⚠️  No decrypted files found to copy!"
+else
+    for FILE in "${DECRYPTED_FILES[@]}"; do
+        FILENAME=$(basename "$FILE")
+        cp "$FILE" "$SCRIPT_DIR/"
+        echo "   ✅ $FILENAME copied"
+        ((COPIED_COUNT++))
+    done
+    echo "   📊 Total files copied: $COPIED_COUNT"
 fi
 
 echo ""
