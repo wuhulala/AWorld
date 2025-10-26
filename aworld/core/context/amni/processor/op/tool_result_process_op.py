@@ -90,6 +90,8 @@ class ToolResultOffloadOp(BaseOp):
         Returns: offloaded tool result
 
         """
+        agent_context_config = context.get_config().get_agent_context_config(namespace)
+
 
         # Extract artifacts from tool result
         artifacts = extract_artifacts_from_toolresult(tool_result)
@@ -101,6 +103,10 @@ class ToolResultOffloadOp(BaseOp):
                 "task_id": context.task_id,
                 "session_id": context.session_id
             })
+
+        if len(artifacts) == 1 and len(artifacts[0].content) < agent_context_config.tool_result_length_threshold:
+            logger.info(f"directly return artifacts content: {len(artifacts[0].content)}")
+            return f"{artifacts[0].content}"
 
         # Do offload
         offloaded_content = await context.offload_by_workspace(artifacts=artifacts, biz_id=tool_result.tool_call_id)

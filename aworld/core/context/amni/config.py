@@ -241,7 +241,7 @@ CONTEXT_OFFLOAD_TOOL_NAME_WHITE = ["arxiv-server:load_article_to_context",
                                        "wiki-server:get_article_categories", "wiki-server:get_article_links",
                                        "ms-playwright:browser_snapshot", "ms-playwright:browser_navigate",
                                        "ms-playwright:browser_click", "ms-playwright:browser_type",
-                                       "ms-playwright:browser_evaluate", "ms-playwright:browser_tab_select",
+                                       "ms-playwright:browser_evaluate", "ms-playwright:browser_tab_select","ms-playwright:browser_tabs",
                                        "ms-playwright:browser_press_key", "ms-playwright:browser_wait_for"
                                        ]
 
@@ -260,7 +260,7 @@ class AmniConfigFactory:
                 history_rounds= 100,
                 enable_summary=True,
                 summary_rounds= 30,
-                summary_context_length= 40960,
+                summary_context_length= 32000,
                 tool_result_offload= True,
                 tool_action_white_list= CONTEXT_OFFLOAD_TOOL_NAME_WHITE,
                 tool_result_length_threshold= 30000
