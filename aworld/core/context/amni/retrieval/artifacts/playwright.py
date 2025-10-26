@@ -632,15 +632,9 @@ class PlaywrightSnapshotArtifact(Artifact):
                 f"{f'<execution_result>{result_context}</execution_result>' if result_context else ''}"
                 f"{f'<open_tabs>{tabs_context}</open_tabs>' if tabs_context else ''}"
                 f"\n{f'<downloads>{downloads_context}</downloads>' if downloads_context else ''}"
-                f"\n<table_elements description='available tables - use browser tools to extract detailed content if needed'>\n"
-                f"{table_elements_context}"
-                f"\n</table_elements>\n"
-                f"<click_elements description='if you use browser_click tool, please search in click_elements'>\n"
-                f"{click_elements_context}"
-                f"\n</click_elements>\n"
                 f"\n<content_extraction_guide>\n"
                 f"📖 To access page content beyond the elements listed above:\n\n"
-                f"1. 🔍 Search for keywords: Use grep_knowledges to search for specific text (e.g., headings, keywords, topics) within this artifact.\n"
+                f"1. 🔍 Search for keywords: Use grep_knowledges to search for specific element reference (e.g., headings, keywords, topics) within this artifact.\n"
                 f"2. 🎯 Extract structured content: Use browser_evaluate to execute JavaScript and extract page content programmatically.\n"
                 f"   Example use cases:\n"
                 f"   - Extract article body: document.querySelector('article').innerText\n"
@@ -648,7 +642,14 @@ class PlaywrightSnapshotArtifact(Artifact):
                 f"   - Extract specific sections: document.querySelector('[ref=eXXX]').innerText\n"
                 f"   - Get paragraph content: Array.from(document.querySelectorAll('p')).map(p => p.textContent)\n\n"
                 f"Choose the appropriate method based on your needs: grep_knowledges for keyword search, browser_evaluate for content extraction.\n"
-                f"</content_extraction_guide>\n")
+                f"</content_extraction_guide>\n"
+                f"\n<table_elements description='available tables - use browser tools to extract detailed content if needed'>\n"
+                f"{table_elements_context}"
+                f"\n</table_elements>\n"
+                f"<click_elements description='if you use browser_click tool, please search in click_elements'>\n"
+                f"{click_elements_context}"
+                f"\n</click_elements>\n"
+              )
 
     def get_clickable_elements_by_type(self, click_type: str):
         def match_type(expected_type, real_type):
