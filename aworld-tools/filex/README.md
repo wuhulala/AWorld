@@ -261,13 +261,13 @@ Useful model variables are:
 
 ## Evaluation
 
-The pinned ParseBench suite contains 2,553 cases. The four completed full
-dimensions remain listed below. The older 5.30% layout number is retired
+The pinned ParseBench suite contains 2,553 cases and all five dimensions have
+reached a trusted terminal state. The older 5.30% layout number is retired
 because it mixed 458 legacy contract zeros with 42 current Document IR results;
 it is not a valid score for the current runtime. A fixed 20-case current-layout
 A/B improved from **62.31% to 76.71%** after the Document IR v3 repair (11
-improved, 9 unchanged, 0 regressed). A new 500-case layout run is required
-before publishing a replacement five-dimension overall score.
+improved, 9 unchanged, 0 regressed). The subsequent clean 500-case layout run
+scored **71.70%**.
 
 | Dimension | Cases | FileX score | Official PaddleOCR-VL-1.6 reference |
 | --- | ---: | ---: | ---: |
@@ -275,12 +275,12 @@ before publishing a replacement five-dimension overall score.
 | Charts | 568 | 56.14% | 54.24% |
 | Content faithfulness | 506 | 82.88% | 82.71% |
 | Semantic formatting | 476 | 48.40% | 54.64% |
-| Visual grounding / layout | 20-case matched A/B | **76.71%** | 77.80% |
-| Equal-weight overall | 2,553 | Pending clean 500-case layout rerun | **67.43%** |
+| Visual grounding / layout | 500 | **71.70%** | 77.80% |
+| Equal-weight overall | 2,553 | **65.35%** | **67.43%** |
 
 Nineteen formatting cases returned `not_scored` and are excluded rather than
-counted as zero. The layout row is explicitly a matched validation sample, not
-the full-suite result or a replacement leaderboard claim. See
+counted as zero. The overall row is the equal-weight mean of the five dimension
+means; the case-weighted mean over 2,534 numeric results is 65.44%. See
 [the ParseBench evaluation report](docs/parsebench-evaluation.md) for pinned
 revisions, methodology, limitations, and the optimization roadmap.
 

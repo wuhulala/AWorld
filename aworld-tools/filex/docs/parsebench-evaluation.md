@@ -17,10 +17,9 @@ planning, LLM quality, or downstream task completion.
   mean across the five dimensions
 
 System/control-plane errors were tracked separately from parser scores. A
-`not_scored` case was not converted to zero. The completed four full dimensions
-contain 19 `not_scored` formatting cases and no unresolved execution failures;
-layout remains a separately reported release-validation sample until its clean
-500-case rerun finishes.
+`not_scored` case was not converted to zero. All five dimensions reached a
+trusted terminal state with no unresolved execution failures. Nineteen
+formatting cases remain `not_scored` and are excluded from score means.
 
 ## Results
 
@@ -30,14 +29,16 @@ layout remains a separately reported release-validation sample until its clean
 | Charts | 568 | 568 | 0 | 56.1396% | 54.24% | +1.8996 pp |
 | Content faithfulness | 506 | 506 | 0 | 82.8802% | 82.71% | +0.1702 pp |
 | Semantic formatting | 476 | 457 | 19 | 48.4013% | 54.64% | -6.2387 pp |
-| Visual grounding / layout | 20-case matched A/B | 20 | 0 | 76.7097% | 77.80% full-suite reference | — |
-| Equal-weight overall | 2,553 | 2,534 | 19 | Pending clean 500-case layout rerun | **67.43%** | — |
+| Visual grounding / layout | 500 | 500 | 0 | 71.6970% | 77.80% | -6.1030 pp |
+| Equal-weight overall | 2,553 | 2,534 | 19 | **65.3520%** | **67.43%** | -2.0780 pp |
 
 The official reference values are the ParseBench published PaddleOCR-VL-1.6
 Full Pipeline results. FileX is close to the reference on tables and content,
-exceeds it on this chart run, and trails on formatting. The layout value above
-is a release-validation sample and must not be read as a full 500-case score or
-directly subtracted from the full-suite official reference.
+exceeds it on this chart run, and trails on formatting and visual grounding.
+The overall value is an equal-weight mean of the five dimension means, matching
+the published leaderboard aggregation. A case-weighted mean over the 2,534
+numeric results is 65.4367%; it answers a different question and should not be
+compared directly with the 67.43% leaderboard overall.
 
 The previously reported 5.2995% layout value is retired: it combined 458
 legacy hard-coded contract zeros with 42 newly scorable Document IR cases. It
@@ -45,6 +46,14 @@ measured a migration state, not the current parser. On the same fixed 20 cases,
 Document IR v3 improved the official mean from 62.3079% to 76.7097% (+14.4018
 percentage points): 11 cases improved, 9 were unchanged, and none regressed.
 The two worst cases moved from 0% to 100% and from 25% to 75%.
+
+The clean 500-case layout result also corrects an evaluation-adapter issue in
+64 PDFs containing both `layout` annotations and legacy `order` rows. The
+upstream JSONL loader otherwise constructs a parse test case instead of a
+layout-detection test case. Only `layout` rows are passed into the official
+layout evaluator; reading order remains scored by that evaluator from each
+annotation's `ro_index`. Those 64 cases all produced numeric scores, averaging
+79.6376%, and the complete 500-case layout mean is 71.6970%.
 
 ## Interpretation
 
@@ -75,8 +84,8 @@ scores do not measure service reliability or throughput.
 
 ## Recommended optimization path
 
-1. Run the repaired layout pipeline across all 500 cases before publishing a
-   new overall score; keep the fixed 20-case A/B as the release regression set.
+1. Keep the fixed 20-case A/B as the release regression set and rerun the full
+   500-case layout suite after detector or mapping changes.
 2. Tune detector thresholds and label aliases against a separate development
    split, especially small pictures and page furniture, without changing the
    pinned official scorer.
@@ -89,7 +98,9 @@ scores do not measure service reliability or throughput.
 ## Reproducibility boundary
 
 This is the newest trusted result for each component, not a single campaign
-executed from one immutable FileX commit. It should be used as an engineering
-baseline and optimization guide. A release claim should pin the FileX image
-digest, parser configuration, hardware profile, data revision, scorer revision,
-and all five campaign manifests.
+executed from one immutable FileX commit. The 500 layout cases use one repaired
+FileX revision, while the five-dimension overall combines the newest trusted
+campaign per dimension. It should be used as an engineering baseline and
+optimization guide. A release claim should pin the FileX image digest, parser
+configuration, hardware profile, data revision, scorer revision, and all five
+campaign manifests.
