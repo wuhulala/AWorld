@@ -17,9 +17,10 @@ planning, LLM quality, or downstream task completion.
   mean across the five dimensions
 
 System/control-plane errors were tracked separately from parser scores. A
-`not_scored` case was not converted to zero. The final baseline contains 2,534
-numeric scores, 19 `not_scored` formatting cases, and no unresolved execution
-failures.
+`not_scored` case was not converted to zero. The completed four full dimensions
+contain 19 `not_scored` formatting cases and no unresolved execution failures;
+layout remains a separately reported release-validation sample until its clean
+500-case rerun finishes.
 
 ## Results
 
@@ -29,13 +30,21 @@ failures.
 | Charts | 568 | 568 | 0 | 56.1396% | 54.24% | +1.8996 pp |
 | Content faithfulness | 506 | 506 | 0 | 82.8802% | 82.71% | +0.1702 pp |
 | Semantic formatting | 476 | 457 | 19 | 48.4013% | 54.64% | -6.2387 pp |
-| Visual grounding / layout | 500 | 500 | 0 | 5.2995% | 77.80% | -72.5005 pp |
-| Equal-weight overall | 2,553 | 2,534 | 19 | **52.0726%** | **67.43%** | **-15.3574 pp** |
+| Visual grounding / layout | 20-case matched A/B | 20 | 0 | 76.7097% | 77.80% full-suite reference | — |
+| Equal-weight overall | 2,553 | 2,534 | 19 | Pending clean 500-case layout rerun | **67.43%** | — |
 
-The official reference values are the ParseBench published
-PaddleOCR-VL-1.6 Full Pipeline results. FileX is close to the reference on
-tables and content, exceeds it on this chart run, trails on formatting, and
-does not yet satisfy the benchmark's grounding contract.
+The official reference values are the ParseBench published PaddleOCR-VL-1.6
+Full Pipeline results. FileX is close to the reference on tables and content,
+exceeds it on this chart run, and trails on formatting. The layout value above
+is a release-validation sample and must not be read as a full 500-case score or
+directly subtracted from the full-suite official reference.
+
+The previously reported 5.2995% layout value is retired: it combined 458
+legacy hard-coded contract zeros with 42 newly scorable Document IR cases. It
+measured a migration state, not the current parser. On the same fixed 20 cases,
+Document IR v3 improved the official mean from 62.3079% to 76.7097% (+14.4018
+percentage points): 11 cases improved, 9 were unchanged, and none regressed.
+The two worst cases moved from 0% to 100% and from 25% to 75%.
 
 ## Interpretation
 
@@ -55,10 +64,10 @@ scores do not measure service reliability or throughput.
 
 ### Main gaps
 
-1. **Visual grounding**: FileX does not yet emit reliable element bounding
-   boxes in the coordinate system required by ParseBench. A correct fix needs
-   page geometry, element identity, coordinate normalization, and confidence;
-   guessing boxes would inflate neither correctness nor usefulness.
+1. **Visual grounding**: Document IR v3 now preserves Paddle detector boxes,
+   confidence, page geometry, and parser text/order metadata. Remaining errors
+   are concentrated in detector misses, class ambiguity, and content
+   attribution for image-only controls.
 2. **Semantic formatting**: headings, lists, emphasis, superscript/subscript,
    and reading-order boundaries still lose information in difficult pages.
 3. **Not-scored formatting cases**: these require separate contract diagnosis;
@@ -66,16 +75,16 @@ scores do not measure service reliability or throughput.
 
 ## Recommended optimization path
 
-1. Extend Document IR v2 with page-relative and pixel-space bounding boxes,
-   source image dimensions, rotation, and stable element IDs.
-2. Carry Paddle layout detections through normalization instead of rebuilding
-   geometry from Markdown.
+1. Run the repaired layout pipeline across all 500 cases before publishing a
+   new overall score; keep the fixed 20-case A/B as the release regression set.
+2. Tune detector thresholds and label aliases against a separate development
+   split, especially small pictures and page furniture, without changing the
+   pinned official scorer.
 3. Add a formatting state machine that reconciles OCR spans with the PDF text
    layer and preserves nested lists, heading levels, emphasis, and scripts.
-4. Create regression sets per formatting rule and grounding object class before
-   another full-suite run.
-5. Re-run only the affected dimensions with pinned data/scorer revisions, then
-   publish a release-level score from one immutable FileX revision.
+4. Create regression sets per formatting rule and grounding object class.
+5. Publish a release-level score only from one immutable FileX revision and
+   complete campaign manifest.
 
 ## Reproducibility boundary
 

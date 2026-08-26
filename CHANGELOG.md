@@ -9,7 +9,12 @@
   `aworld-cli` image behavior.
 - Added the asynchronous HTTP service, direct URL/object-reference ingestion,
   bounded queuing, persistent PaddleOCR-VL worker lifecycle, resumable PDF
-  batches, Document IR v2 formatting repair, and video evidence artifacts.
+  batches, Document IR v3 grounding/formatting repair, and video evidence
+  artifacts.
+- Preserved Paddle's detector geometry and confidence before VLM block merging,
+  normalized contextual page labels, and removed HTML/Markdown presentation
+  tokens from grounding attribution text. On a fixed 20-case Layout sample,
+  the official score improved from 62.31% to 76.71% with zero regressions.
 - Added public deployment, hardware, configuration, operations, and security
   documentation plus a pinned ParseBench evaluation report.
 - Removed environment-specific deployment history, internal hosts, repository
