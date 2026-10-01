@@ -2,7 +2,7 @@
 
 The root `aworld` wheel includes the Session/Run kernel, Agent, Context, Tools, optional model adapter, CLI and ATIF export. `aworld` remains the Python import and command. There is no `aworldv1` Python package. `aworldv1` is the separate Runtime Harness identifier.
 
-Hatchling reads a literal version from `aworld/_version.py`. Builds neither import business modules nor invoke pip; default dependencies are empty. Install `.[llm,skills]` to use the HTTPX Chat Completions adapter and discover YAML Skill metadata. `aworld-cli` is an optional delegating wrapper depending on this same root wheel.
+Hatchling reads a literal version from `aworld/_version.py`. Builds neither import business modules nor invoke pip; default dependencies are empty. Install `.[llm,skills]` to use the existing OpenAIProvider through the Model protocol adapter and discover YAML Skill metadata. `aworld-cli` is an optional delegating wrapper depending on this same root wheel.
 
 ```bash
 python scripts/build_packages.py
@@ -20,4 +20,4 @@ The Micron integration test used the local search-api Skill and a real model. It
 
 `build_packages.py` builds both projects in one invocation, checks that CLI and core versions and dependencies agree, and writes `packages.json` with wheel/sdist SHA256 values. The Runtime bundle installs the two wheels together.
 
-Historical code, CLI, resources and tests are retained in the repository. Wheels select explicit new entry files, so restoring historical source does not reintroduce old imports or dependencies into the default Runtime. Historical source remains in sdists for review; cleanup will happen gradually after the new version stabilizes.
+Historical code, CLI, resources and tests are retained in the repository. Wheels explicitly include the new kernel and the existing provider dependency closure with local tokenizer resources. Default kernel/demo imports remain lazy; live models opt into the provider dependencies through `llm`. Historical source remains in sdists for review; cleanup will happen gradually after the new version stabilizes.

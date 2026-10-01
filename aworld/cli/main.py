@@ -92,6 +92,7 @@ def parser():
     value.add_argument("--max-turns", type=int, default=20)
     value.add_argument("--timeout", type=float, help="Total execution budget per run in seconds")
     value.add_argument("--request-timeout", type=float, default=60)
+    value.add_argument("--max-retries", type=int, default=3, help="Retries per unresolved model request (0-10)")
     value.add_argument("--reasoning-effort", choices=["none", "minimal", "low", "medium", "high", "xhigh"])
     value.add_argument("--json", action="store_true", help="Write one terminal RunResult JSON per line")
     value.add_argument("--events", action="store_true", help="Write observed Run events as JSON lines to stderr")
@@ -146,7 +147,7 @@ async def _host(args, command):
         from aworld.models.chat_completions import ChatCompletionsModel
         model = ChatCompletionsModel(model=args.model, base_url=args.base_url,
             api_key=os.getenv("AWORLD_API_KEY") or os.getenv("OPENAI_API_KEY"),
-            timeout=args.request_timeout, reasoning_effort=args.reasoning_effort)
+            timeout=args.request_timeout, reasoning_effort=args.reasoning_effort, max_retries=args.max_retries)
     sessions = InMemorySessionStore()
     try:
         agent = Agent(model=model, tools=registry, skills=skills, system_prompt=args.system_prompt, max_turns=args.max_turns)

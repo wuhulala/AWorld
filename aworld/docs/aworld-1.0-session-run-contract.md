@@ -52,6 +52,12 @@ session = await load_session(session.id, store=store)
 投影到模型请求时不会重复发送。当前只支持文本和完整响应；流式、多模态尚未实现。
 适配器须保证已完成的调用参数，不把截断或失败响应伪装成成功结束。
 
+ChatCompletionsModel 通过 ProviderModel 适配原 OpenAIProvider.acompletion()，默认使用 async SDK 路径。
+模型通信与重试复用原 provider；CLI --max-retries 设置默认 3 次重试，原禁用重试环境变量仍生效。
+适配层没有外层重试，工具不回放；不完整模型响应仍视为失败，Run 总预算和取消约束整次调用。
+原 provider 与旧 Context/compiler/tokenizer/缓存/日志的耦合本轮保留，见
+[Provider 复用与技术债](aworld-1.0-provider-reuse-debt.md)。
+
 同一 Agent 可供独立 Session 使用，循环变量均为 Run 局部变量；注入的模型/工具若自身有
 可变共享资源，其实现需满足宿主并发要求。历史与请求、结果、事件 payload 都进行 deepcopy 隔离。
 上下文策略在每次模型请求前执行，不删除完整历史。每一轮工具调用均保留调用 ID 与对应结果。

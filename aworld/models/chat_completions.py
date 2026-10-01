@@ -1,7 +1,9 @@
-"""Optional HTTP adapter for text/function-tool Chat Completions endpoints."""
+"""Adapt the existing LLM provider to the Session/Run model protocol."""
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import json
 import math
 from urllib.parse import urlsplit
@@ -64,10 +66,64 @@ def parse_response(payload: dict) -> AssistantMessage:
     return AssistantMessage(content, tuple(calls))
 
 
-class ChatCompletionsModel:
-    """HTTPX is imported only on explicit provider construction; never installed."""
+class ProviderModel:
+    """Convert messages only; provider owns transport, parsing and retries."""
+
+    def __init__(self, provider, *, model: str, reasoning_effort: str | None = None,
+                 owns_provider: bool = False):
+        self._provider = provider
+        self._model, self._reasoning_effort = model, reasoning_effort
+        self._owns_provider = owns_provider
+
+    async def complete(self, request: ModelRequest) -> AssistantMessage:
+        payload = request_payload(request, self._model, self._reasoning_effort)
+        payload.pop("model")
+        payload.pop("stream")
+        messages = payload.pop("messages")
+        try:
+            response = await self._provider.acompletion(messages=messages, **payload)
+        except Exception as exc:
+            # Legacy errors may contain endpoint/response data. Expose only the
+            # status or deepest exception type in RunResult/ATIF.
+            current, seen, status = exc, set(), None
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                status = status or getattr(current, "status_code", None)
+                cause = current.__cause__ or current.__context__
+                if cause is None:
+                    break
+                current = cause
+            detail = f"HTTP {status}" if status is not None else type(current).__name__
+            raise RuntimeError(f"Model provider failed: {detail}") from None
+        raw = response.raw_response
+        if not isinstance(raw, dict):
+            raw = raw.model_dump(mode="json")
+        # Validate the original response: legacy normalization may fabricate
+        # missing tool ids/names. Incomplete output must not dispatch tools.
+        return parse_response(raw)
+
+    async def aclose(self):
+        if not self._owns_provider:
+            return
+        closed = set()
+        for client in (getattr(self._provider, "async_provider", None),
+                       getattr(self._provider, "provider", None)):
+            if client is None or id(client) in closed:
+                continue
+            closed.add(id(client))
+            close = getattr(client, "aclose", None) or getattr(client, "close", None)
+            if close:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+
+
+class ChatCompletionsModel(ProviderModel):
+    """Construct the original OpenAIProvider lazily using its async SDK path."""
+
     def __init__(self, *, model: str, base_url: str = "https://api.openai.com/v1",
-                 api_key: str | None = None, timeout: float = 60, reasoning_effort: str | None = None):
+                 api_key: str | None = None, timeout: float = 60,
+                 reasoning_effort: str | None = None, max_retries: int = 3):
         if not isinstance(model, str) or not model.strip():
             raise ValueError("Specify --model or AWORLD_MODEL")
         parsed = urlsplit(base_url)
@@ -77,23 +133,21 @@ class ChatCompletionsModel:
             raise ValueError("Set AWORLD_API_KEY or OPENAI_API_KEY in the environment")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("request timeout must be positive finite seconds")
+        if type(max_retries) is not int or not 0 <= max_retries <= 10:
+            raise ValueError("max_retries must be an integer between 0 and 10")
+        # Check before importing legacy modules: tokenizer helpers can install
+        # missing packages. All dependencies must be installed explicitly.
+        modules = ("openai", "httpx", "pydantic", "yaml", "loguru", "numpy",
+                   "tiktoken", "requests", "wrapt", "executing", "packaging",
+                   "fastapi", "importlib_metadata", "opentelemetry.sdk")
         try:
-            import httpx
-        except ImportError:
-            raise RuntimeError('Live models need the optional dependency: pip install "aworld[llm]"') from None
-        self._httpx = httpx
-        self._model, self._reasoning_effort = model, reasoning_effort
-        self._url = base_url.rstrip("/") + "/chat/completions"
-        self._client = httpx.AsyncClient(timeout=timeout, headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
-
-    async def complete(self, request: ModelRequest) -> AssistantMessage:
-        try:
-            response = await self._client.post(self._url, json=request_payload(request, self._model, self._reasoning_effort))
-        except self._httpx.HTTPError as exc:
-            raise RuntimeError(f"Model transport failed: {type(exc).__name__}") from None
-        if response.is_error:
-            raise RuntimeError(f"Model request failed: HTTP {response.status_code}")
-        return parse_response(response.json())
-
-    async def aclose(self):
-        await self._client.aclose()
+            missing = [name for name in modules if importlib.util.find_spec(name) is None]
+        except ModuleNotFoundError:
+            missing = ["provider dependencies"]
+        if missing:
+            raise RuntimeError('Live models need the optional dependencies: pip install "aworld[llm]"')
+        from aworld.models.openai_provider import OpenAIProvider
+        provider = OpenAIProvider(model_name=model, base_url=base_url,
+            api_key=api_key or "local-no-key", sync_enabled=False,
+            async_enabled=True, timeout=timeout, max_retries=max_retries)
+        super().__init__(provider, model=model, reasoning_effort=reasoning_effort, owns_provider=True)
