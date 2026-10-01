@@ -14,6 +14,8 @@ API Key 通过 AWORLD_API_KEY / OPENAI_API_KEY 传入。默认 LocalSandbox 提�
 
 旧框架、旧 CLI、资源和测试保留在源码中。新版默认入口单独打包，默认不加载旧模块。默认无第三方依赖，模型连接、Skill 解析分别通过 llm、skills extras 选择；没有构建期间导入业务代码或自动安装依赖。
 
+当前 Session 在进程内保存，Context 使用完整历史，暂未提供跨进程会话持久化、按 token 压缩、流式响应及模型重试策略。
+
 详见 [接口契约](aworld/docs/aworld-1.0-session-run-contract.md) 和 [打包与 CLI](aworld/docs/aworld-1.0-packaging-cli.md)。
 
 ---

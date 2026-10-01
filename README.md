@@ -18,6 +18,8 @@ Historical framework, CLI, resources and tests remain in the source tree. The ne
 
 Build with `python -m build`; packaging is declared in `pyproject.toml` using Hatchling. The default build does not execute the retained legacy setup.py or hatch_build.py scripts.
 
+The first version uses in-process Sessions and full context history. It does not yet provide cross-process session persistence, token-budget compaction, streaming or provider retry policies.
+
 [Session/Run contract](aworld/docs/aworld-1.0-session-run-contract.md) · [CLI and packaging](aworld/docs/aworld-1.0-packaging-cli.md)
 
 ---

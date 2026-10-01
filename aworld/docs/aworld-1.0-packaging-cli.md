@@ -21,5 +21,3 @@ The Micron integration test used the local search-api Skill and a real model. It
 `build_packages.py` builds both projects in one invocation, checks that CLI and core versions and dependencies agree, and writes `packages.json` with wheel/sdist SHA256 values. The Runtime bundle installs the two wheels together.
 
 Historical code, CLI, resources and tests are retained in the repository. Wheels select explicit new entry files, so restoring historical source does not reintroduce old imports or dependencies into the default Runtime. Historical source remains in sdists for review; cleanup will happen gradually after the new version stabilizes.
-
-Current implementation scope: Sessions are stored in process and Context projects the full history. Cross-process session persistence, token-budget compaction, streaming and provider retries remain future work.
