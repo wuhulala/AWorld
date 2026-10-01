@@ -1,0 +1,499 @@
+# coding: utf-8
+# Copyright (c) 2025 inclusionAI.
+import asyncio
+import importlib.util
+import inspect
+import json
+import os
+import pkgutil
+import re
+import socket
+import sys
+import threading
+import time
+import traceback
+
+from functools import wraps
+from pathlib import Path
+from types import FunctionType, MethodType
+from typing import Callable, Any, Tuple, List, Iterator, Dict, Union
+
+from aworld.logs.util import logger
+
+
+def convert_to_snake(name: str) -> str:
+    """Class name convert to snake."""
+    if '_' not in name:
+        name = re.sub(r'([a-z])([A-Z])', r'\1_\2', name)
+    return name.lower()
+
+
+def snake_to_camel(snake):
+    words = snake.split('_')
+    return ''.join([w.capitalize() for w in words])
+
+
+def is_abstract_method(cls, method_name):
+    method = getattr(cls, method_name)
+    return (hasattr(method, '__isabstractmethod__') and method.__isabstractmethod__) or (
+            isinstance(method, FunctionType) and hasattr(
+        method, '__abstractmethods__') and method in method.__abstractmethods__)
+
+
+def override_in_subclass(name: str, sub_cls: object, base_cls: object) -> bool:
+    """Judge whether a subclass overrides a specified method.
+
+    Args:
+        name: The method name of sub class and base class
+        sub_cls: Specify subclasses of the base class.
+        base_cls: The parent class of the subclass.
+
+    Returns:
+        Overwrite as true in subclasses, vice versa.
+    """
+    if not issubclass(sub_cls, base_cls):
+        logger.warning(f"{sub_cls} is not sub class of {base_cls}")
+        return False
+
+    if sub_cls == base_cls and hasattr(sub_cls, name) and not is_abstract_method(sub_cls, name):
+        return True
+
+    this_method = getattr(sub_cls, name)
+    base_method = getattr(base_cls, name)
+    return this_method is not base_method
+
+
+def convert_to_subclass(obj, subclass):
+    obj.__class__ = subclass
+    return obj
+
+
+def _walk_to_root(path: str) -> Iterator[str]:
+    """Yield directories starting from the given directory up to the root."""
+    if not os.path.exists(path):
+        yield ''
+
+    if os.path.isfile(path):
+        path = os.path.dirname(path)
+
+    last_dir = None
+    current_dir = os.path.abspath(path)
+    while last_dir != current_dir:
+        yield current_dir
+        parent_dir = os.path.abspath(os.path.join(current_dir, os.path.pardir))
+        last_dir, current_dir = current_dir, parent_dir
+
+
+def find_file(filename: str) -> str:
+    """Find file from the folders for the given file.
+
+    NOTE: Current running path priority, followed by the execution file path, and finally the aworld package path.
+
+    Args:
+        filename: The file name that you want to search.
+    """
+
+    def run_dir():
+        try:
+            main = __import__('__main__', None, None, fromlist=['__file__'])
+            return os.path.dirname(main.__file__)
+        except ModuleNotFoundError:
+            return os.getcwd()
+
+    path = os.getcwd()
+    if os.path.exists(os.path.join(path, filename)):
+        path = os.getcwd()
+    elif os.path.exists(os.path.join(run_dir(), filename)):
+        path = run_dir()
+    else:
+        frame = inspect.currentframe()
+        current_file = __file__
+
+        while frame.f_code.co_filename == current_file or not os.path.exists(
+                frame.f_code.co_filename
+        ):
+            assert frame.f_back is not None
+            frame = frame.f_back
+        frame_filename = frame.f_code.co_filename
+        path = os.path.dirname(os.path.abspath(frame_filename))
+
+    for dirname in _walk_to_root(path):
+        if not dirname:
+            continue
+        check_path = os.path.join(dirname, filename)
+        if os.path.isfile(check_path):
+            return check_path
+
+    return ''
+
+
+def search_in_module(module: object, base_classes: List[type]) -> List[Tuple[str, type]]:
+    """Find all classes that inherit from a specific base class in the module."""
+    results = []
+    for name, obj in inspect.getmembers(module, inspect.isclass):
+        for base_class in base_classes:
+            if issubclass(obj, base_class) and obj is not base_class:
+                results.append((name, obj))
+    return results
+
+
+def _scan_package(package_name: str, base_classes: List[type], results: List[Tuple[str, type]] = []):
+    try:
+        package = sys.modules[package_name]
+    except:
+        return
+
+    try:
+        for sub_package, name, is_pkg in pkgutil.walk_packages(package.__path__):
+            try:
+                __import__(f"{package_name}.{name}")
+            except:
+                continue
+
+            if is_pkg:
+                _scan_package(package_name + "." + name, base_classes, results)
+            try:
+                module = __import__(f"{package_name}.{name}", fromlist=[name])
+                results.extend(search_in_module(module, base_classes))
+            except:
+                continue
+    except:
+        pass
+
+
+def scan_packages(package: str, base_classes: List[type]) -> List[Tuple[str, type]]:
+    results = []
+    _scan_package(package, base_classes, results)
+    return results
+
+
+class ReturnThread(threading.Thread):
+    def __init__(self, func, *args, **kwargs):
+        threading.Thread.__init__(self)
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.result = None
+        self.daemon = True
+
+    def run(self):
+        self.result = asyncio.run(self.func(*self.args, **self.kwargs))
+
+
+def asyncio_loop():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    return loop
+
+
+def sync_exec(async_func: Callable[..., Any], *args, **kwargs):
+    """Async function to sync execution."""
+    if not asyncio.iscoroutinefunction(async_func):
+        return async_func(*args, **kwargs)
+
+    loop = asyncio_loop()
+    if loop and loop.is_running():
+        thread = ReturnThread(async_func, *args, **kwargs)
+        thread.start()
+        thread.join()
+        result = thread.result
+    else:
+        result = asyncio.run(async_func(*args, **kwargs))
+    return result
+
+
+def trigger_background_task(context_or_message: Any, coro: Any, agent_id: str = None, agent_name: str = None):
+    """Unified interface for triggering a background task.
+
+    Args:
+        context_or_message: The context or message to record the background task in.
+        coro: The coroutine to run in the background.
+        agent_id: The ID of the agent that triggered this background task.
+        agent_name: The name of the agent that triggered this background task.
+    """
+    import uuid
+    from aworld.core.event.base import Message
+    
+    context = context_or_message
+    if isinstance(context_or_message, Message):
+        context = context_or_message.context
+        if not agent_id and context_or_message.payload and isinstance(context_or_message.payload, list) and len(context_or_message.payload) > 0:
+            # Try to get agent info from message payload (ActionModel)
+            action = context_or_message.payload[0]
+            agent_name = agent_name or action.agent_name
+            if context.swarm and agent_name:
+                agent = context.swarm.agents.get(agent_name)
+                if agent:
+                    agent_id = agent.id()
+        
+        if not agent_id:
+            agent_id = context_or_message.sender # Fallback
+            agent_name = agent_name or context_or_message.sender
+
+    task_id = f"bg_{uuid.uuid4().hex}"
+    parent_task_id = getattr(context, 'task_id', None)
+
+    # context might be any object that has add_background_task and mark_background_task_completed
+    if hasattr(context, 'add_background_task'):
+        context.add_background_task(task_id, agent_id, agent_name, parent_task_id=parent_task_id)
+    else:
+        logger.warning(f"Context {type(context)} does not have add_background_task method")
+
+    async def _wrapper():
+        try:
+            await coro
+        except Exception as e:
+            logger.error(f"Background task {task_id} failed: {e}\n{traceback.format_exc()}")
+        finally:
+            if hasattr(context, 'mark_background_task_completed'):
+                context.mark_background_task_completed(task_id)
+            else:
+                logger.warning(f"Context {type(context)} does not have mark_background_task_completed method")
+
+    return asyncio.create_task(_wrapper())
+
+
+def _coerce_count_value(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def nest_dict_counter(usage: Dict[str, Union[int, Dict[str, int]]],
+                      other: Dict[str, Union[int, Dict[str, int]]],
+                      ignore_zero: bool = False):
+    """Add counts from two dicts or nest dicts."""
+    result = {}
+    usage = usage or {}
+    other = other or {}
+
+    for elem in set(usage.keys()) | set(other.keys()):
+        usage_value = usage.get(elem, 0)
+        other_value = other.get(elem, 0)
+
+        if isinstance(usage_value, Dict) or isinstance(other_value, Dict):
+            nested_usage = usage_value if isinstance(usage_value, Dict) else {}
+            nested_other = other_value if isinstance(other_value, Dict) else {}
+            res = nest_dict_counter(nested_usage, nested_other, ignore_zero=ignore_zero)
+            if res or not ignore_zero:
+                result[elem] = res
+            continue
+
+        newcount = _coerce_count_value(usage_value) + _coerce_count_value(other_value)
+        if not ignore_zero or newcount > 0:
+            result[elem] = newcount
+    return result
+
+
+def nest_dict_diff(
+    usage: Dict[str, Union[int, Dict[str, int]]],
+    baseline: Dict[str, Union[int, Dict[str, int]]],
+    ignore_zero: bool = True,
+):
+    """Recursively compute the positive net increment between two nested usage dicts."""
+    result = {}
+    keys = set(usage.keys()) | set(baseline.keys())
+
+    for elem in keys:
+        usage_value = usage.get(elem, 0)
+        baseline_value = baseline.get(elem, 0)
+
+        if isinstance(usage_value, Dict) or isinstance(baseline_value, Dict):
+            nested_usage = usage_value if isinstance(usage_value, Dict) else {}
+            nested_baseline = baseline_value if isinstance(baseline_value, Dict) else {}
+            nested_result = nest_dict_diff(
+                nested_usage,
+                nested_baseline,
+                ignore_zero=ignore_zero,
+            )
+            if nested_result or not ignore_zero:
+                result[elem] = nested_result
+            continue
+
+        usage_numeric = usage_value if usage_value is not None else 0
+        baseline_numeric = baseline_value if baseline_value is not None else 0
+
+        try:
+            net_value = usage_numeric - baseline_numeric
+        except TypeError:
+            try:
+                net_value = int(usage_numeric) - int(baseline_numeric)
+            except (TypeError, ValueError):
+                continue
+
+        if ignore_zero:
+            if net_value > 0:
+                result[elem] = net_value
+        elif net_value != 0:
+            result[elem] = net_value
+
+    return result
+
+
+def get_class(module_class: str):
+    import importlib
+
+    assert module_class
+    module_class = module_class.strip()
+    idx = module_class.rfind('.')
+    if idx != -1:
+        module = importlib.import_module(module_class[0:idx])
+        class_names = module_class[idx + 1:].split(":")
+        cls_obj = getattr(module, class_names[0])
+        for inner_class_name in class_names[1:]:
+            cls_obj = getattr(cls_obj, inner_class_name)
+        return cls_obj
+    else:
+        raise Exception("{} can not find!".format(module_class))
+
+
+def new_instance(module_class: str, *args, **kwargs):
+    """Create module class instance based on module name."""
+    return get_class(module_class)(*args, **kwargs)
+
+
+def load_module_by_path(module_name: str, file_path: str):
+    """Load python module from the file path."""
+    file_path = str(Path(file_path).resolve())
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except:
+        logger.info(f"loading {module_name} fail from {file_path}, {traceback.format_exc()}")
+
+
+def retryable(tries: int = 3, delay: int = 1):
+    def inner_retry(f):
+        @wraps(f)
+        def f_retry(*args, **kwargs):
+            mtries, mdelay = tries, delay
+            while mtries > 0:
+                try:
+                    return f(*args, **kwargs)
+                except Exception as e:
+                    msg = f"{str(e)}, Retrying in {mdelay} seconds..."
+                    logger.warning(msg)
+                    time.sleep(mdelay)
+                    mtries -= 1
+            return f(*args, **kwargs)
+
+        return f_retry
+
+    return inner_retry
+
+
+def get_local_ip():
+    try:
+        # build UDP socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # connect to an external address (no need to connect)
+        s.connect(("8.8.8.8", 80))
+        # get local IP
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def replace_env_variables(config) -> Any:
+    """Replace environment variables in configuration.
+
+    Environment variables should be in the format ${ENV_VAR_NAME}.
+
+    Args:
+        config: Configuration to process (dict, list, or other value)
+
+    Returns:
+        Processed configuration with environment variables replaced
+    """
+    if isinstance(config, dict):
+        for key, value in config.items():
+            config[key] = replace_env_variables(value)
+    elif isinstance(config, list):
+        for i, item in enumerate(config):
+            config[i] = replace_env_variables(item)
+    elif isinstance(config, str):
+        pattern = r'\${([^}]+)}'
+        matches = re.findall(pattern, config)
+        for env_var_name in matches:
+            env_var_value = os.getenv(env_var_name, f"${{{env_var_name}}}")
+            config = config.replace(f'${{{env_var_name}}}', env_var_value)
+            if env_var_value != f"${{{env_var_name}}}":
+                logger.info(f"Replaced ${{{env_var_name}}} with {env_var_value}")
+    return config
+
+
+def get_local_hostname():
+    """
+    Get the local hostname.
+    First try `socket.gethostname()`, if it fails or returns an invalid value,
+    then try reverse DNS lookup using local IP.
+    """
+    try:
+        hostname = socket.gethostname()
+        # Simple validation - if hostname contains '.', consider it a valid FQDN (Fully Qualified Domain Name)
+        if hostname and '.' in hostname:
+            return hostname
+
+        # If hostname is not qualified, try reverse lookup via IP
+        local_ip = get_local_ip()
+        if local_ip:
+            try:
+                # Get hostname from IP
+                hostname, _, _ = socket.gethostbyaddr(local_ip)
+                return hostname
+            except (socket.herror, socket.gaierror):
+                # Reverse lookup failed, return original hostname or IP
+                pass
+
+        # If all methods fail, return original gethostname() result or IP
+        return hostname if hostname else local_ip
+
+    except Exception:
+        # Final fallback strategy
+        return "localhost"
+
+
+def experimental(msg: Union[str, FunctionType, MethodType] = None):
+    """Experimental function decorator, triggers a warning when interface used as it may be adjusted in the future."""
+
+    def _decorator(func):
+        @wraps(func)
+        def _new_func(*args, **kwargs):
+            warn_msg = f"Call to experimental function {func.__name__}."
+            if isinstance(msg, str):
+                warn_msg += f"\n{msg}"
+
+            logger.warning(warn_msg)
+            return func(*args, **kwargs)
+
+        _new_func.__doc__ = None
+        return _new_func
+
+    if isinstance(msg, (FunctionType, MethodType)):
+        return _decorator(msg)
+    return _decorator
+
+
+def load_mcp_config():
+    """Load MCP server configurations from config file."""
+
+    path_cwd = os.getcwd()
+    mcp_path = os.path.join(path_cwd, "mcp.json")
+    try:
+        with open(mcp_path, "r") as f:
+            return json.load(f)
+    except Exception as err:
+        logger.error(f"Error loading MCP config[{mcp_path}] err is : {err}")

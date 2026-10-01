@@ -24,10 +24,44 @@ dev = ["pytest>=8", "build>=1.2,<2", "hatchling>=1.27,<2", "editables>=0.5,<1"]
 path = "aworld/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aworld"]
+only-include = [
+    "aworld/LICENSE",
+    "aworld/README.md",
+    "aworld/__init__.py",
+    "aworld/__main__.py",
+    "aworld/_version.py",
+    "aworld/cli/__init__.py",
+    "aworld/cli/main.py",
+    "aworld/cli/trajectory.py",
+    "aworld/core/__init__.py",
+    "aworld/core/agent/__init__.py",
+    "aworld/core/agent/loop.py",
+    "aworld/core/agent/messages.py",
+    "aworld/core/agent/skill.py",
+    "aworld/core/context/__init__.py",
+    "aworld/core/context/simple.py",
+    "aworld/core/context/storage.py",
+    "aworld/core/sandbox/__init__.py",
+    "aworld/core/sandbox/local.py",
+    "aworld/core/session/__init__.py",
+    "aworld/core/session/errors.py",
+    "aworld/core/session/memory.py",
+    "aworld/core/session/models.py",
+    "aworld/core/session/protocols.py",
+    "aworld/core/tool/__init__.py",
+    "aworld/core/tool/function.py",
+    "aworld/core/tool/local.py",
+    "aworld/core/tool/registry.py",
+    "aworld/core/tool/sessions.py",
+    "aworld/core/tool/subagent.py",
+    "aworld/docs/aworld-1.0-packaging-cli.md",
+    "aworld/docs/aworld-1.0-session-run-contract.md",
+    "aworld/models/__init__.py",
+    "aworld/models/chat_completions.py",
+]
 
 [tool.hatch.build.targets.sdist]
-include = ["/aworld", "/aworld-cli", "/examples/core_session", "/tests", "/conftest.py", "/pytest.ini", "/scripts/build_packages.py", "/pyproject.toml", "/README.md", "/README_zh.md", "/LICENSE"]
+include = ["/aworld", "/aworld-cli", "/examples/core_session", "/tests", "/conftest.py", "/pytest.ini", "/pytest.legacy.ini", "/setup.py", "/scripts/build_packages.py", "/pyproject.toml", "/README.md", "/README_zh.md", "/LICENSE"]
 
 [tool.hatch.build]
 exclude = ["**/__pycache__/**", "**/*.pyc", "**/.env", "**/.venv/**", "/dist/**", "/aworld-cli/dist/**", "**/.pytest_cache/**"]

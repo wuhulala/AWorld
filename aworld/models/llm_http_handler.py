@@ -1,0 +1,566 @@
+"""HTTP handler for LLM providers.
+
+This module provides a generic HTTP handler for making requests to LLM providers
+when direct SDK usage is not desired.
+"""
+
+import json
+import asyncio
+import random
+import time
+from typing import Any, Dict, List, Optional, Union, Generator, AsyncGenerator
+import requests
+from requests import HTTPError
+
+from aworld.logs.util import logger
+from aworld.utils import import_package
+
+class LLMHTTPHandler:
+    """HTTP handler for LLM providers.
+
+    This class provides methods to make HTTP requests to LLM providers
+    instead of using their SDKs directly.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model_name: str,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: int = 180,
+        max_retries: int = 3,
+    ) -> None:
+        """Initialize the HTTP handler.
+
+        Args:
+            base_url: Base URL for the LLM API.
+            api_key: API key for authentication.
+            model_name: Name of the model to use.
+            headers: Additional headers to include in requests.
+            timeout: Request timeout in seconds.
+            max_retries: Maximum number of retries for failed requests.
+        """
+        import_package("aiohttp")
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model_name = model_name
+        self.timeout = timeout
+        self.max_retries = max_retries
+
+        # Set up default headers
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        if headers:
+            self.headers.update(headers)
+
+    def _parse_sse_line(self, line: bytes) -> Optional[Dict[str, Any]]:
+        """Parse a Server-Sent Events (SSE) line.
+
+        Args:
+            line: Raw SSE line.
+
+        Returns:
+            Parsed JSON data if successful, None otherwise.
+        """
+        try:
+            # Remove 'data: ' prefix if present
+            line_str = line.decode('utf-8').strip()
+            if line_str.startswith('data:'):
+                line_str = line_str[5:].lstrip()
+
+            # Skip empty lines
+            if not line_str:
+                return None
+
+            return json.loads(line_str)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.warning(f"Failed to parse SSE line: {line}, error: {str(e)}")
+            return None
+
+    def _make_request(
+        self,
+        endpoint: str,
+        data: Dict[str, Any],
+        stream: bool = False,
+        headers: Optional[Dict[str, str]] = None,
+        request_body_type: str = "json",
+        serialized_body: bytes | None = None,
+    ) -> Union[Dict[str, Any], Generator[Dict[str, Any], None, None]]:
+        """Make a synchronous HTTP request.
+
+        Args:
+            endpoint: API endpoint to call.
+            data: Request data to send.
+            stream: Whether to stream the response.
+
+        Returns:
+            Response data or generator of response chunks.
+
+        Raises:
+            requests.exceptions.RequestException: If the request fails.
+        """
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        request_headers = self.headers.copy()
+        if headers:
+            request_headers.update(headers)
+
+        if request_body_type not in {"json", "multipart"}:
+            raise ValueError(f"Unsupported request_body_type: {request_body_type}")
+
+        if request_body_type == "multipart":
+            request_headers.pop("Content-Type", None)
+
+        request_kwargs: Dict[str, Any] = {
+            "headers": request_headers,
+            "timeout": self.timeout,
+        }
+        if request_body_type == "multipart":
+            if serialized_body is not None:
+                raise ValueError("serialized_body is only valid for JSON requests")
+            request_kwargs["files"] = self._encode_multipart_fields(data)
+        elif serialized_body is not None:
+            if not isinstance(serialized_body, bytes):
+                raise TypeError("serialized_body must be bytes or None")
+            request_kwargs["data"] = serialized_body
+        else:
+            request_kwargs["json"] = data
+
+        try:
+            if stream:
+                    if request_body_type != "json":
+                        raise ValueError("Streaming requests only support JSON request bodies")
+                    request_kwargs["timeout"] = (30, 60)
+                    response = requests.post(
+                        url,
+                        stream=True,
+                        **request_kwargs,
+                    )
+                    response.raise_for_status()
+
+                    def generate_chunks():
+                        for line in response.iter_lines(chunk_size=1024):
+                            if line:
+                                line_str = line.decode('utf-8').strip()
+                                if line_str.startswith('data: '):
+                                    line_content = line_str[6:]
+
+                                    if line_content == "[DONE]":
+                                        yield {"status": "done", "message": "Stream completed"}
+                                        break
+                                    elif line_content == "[REVOKE]":
+                                        yield {"status": "revoke", "message": "Content should be revoked"}
+                                        continue
+                                    elif line_content == "[FAIL]":
+                                        yield {"status": "fail", "message": "Request failed"}
+                                        break
+                                    elif line_content.startswith("[FAIL]_stream was reset: CANCEL"):
+                                        yield {"status": "cancel", "message": "Stream was cancelled"}
+                                        break
+
+                                chunk = self._parse_sse_line(line)
+                                if chunk is not None:
+                                    yield chunk
+                    return generate_chunks()
+            else:
+                response = requests.post(
+                    url,
+                    **request_kwargs,
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            logger.error(f"Error in HttpHandler: {str(e)}")
+            raise
+
+    async def _make_async_request_stream(
+        self,
+        endpoint: str,
+        data: Dict[str, Any],
+        headers: Optional[Dict[str, str]] = None,
+        request_body_type: str = "json",
+        serialized_body: bytes | None = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Make an asynchronous streaming HTTP request.
+
+        Args:
+            endpoint: API endpoint to call.
+            data: Request data to send.
+
+        Yields:
+            Response chunks.
+
+        Raises:
+            aiohttp.ClientError: If the request fails.
+        """
+        import aiohttp
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        request_headers = self.headers.copy()
+        if headers:
+            request_headers.update(headers)
+        if request_body_type != "json":
+            raise ValueError("Streaming requests only support JSON request bodies")
+
+        # Configure timeout with separate read timeout for streaming
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout,      # Total timeout (default 180s)
+            connect=30,              # Connection timeout 30s
+            sock_read=60             # Socket read timeout 60s - critical for streaming
+        )
+
+        # Configure TCP connector with connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=100,               # Total connection pool size
+            limit_per_host=30,       # Connections per host
+            ttl_dns_cache=300,       # DNS cache TTL 5 minutes
+            keepalive_timeout=30     # Keep-Alive timeout
+        )
+
+        # Create session with proper timeout and connector
+        session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        try:
+            body_kwargs = (
+                {"data": serialized_body}
+                if serialized_body is not None
+                else {"json": data}
+            )
+            response = await session.post(
+                url,
+                headers=request_headers,
+                **body_kwargs,
+            )
+            response.raise_for_status()
+
+            # Use chunked iteration for proper streaming handling
+            async for chunk in response.content.iter_chunked(1024):
+                # Process each chunk and split by newlines
+                for line in chunk.split(b'\n'):
+                    if line:
+                        line_str = line.decode('utf-8').strip()
+                        if line_str.startswith('data: '):
+                            line_content = line_str[6:]
+
+                            if line_content == "[DONE]":
+                                yield {"status": "done", "message": "Stream completed"}
+                                break
+                            elif line_content == "[REVOKE]":
+                                yield {"status": "revoke", "message": "Content should be revoked"}
+                                continue
+                            elif line_content == "[FAIL]":
+                                yield {"status": "fail", "message": "Request failed"}
+                                break
+                            elif line_content.startswith("[FAIL]_stream was reset: CANCEL"):
+                                yield {"status": "cancel", "message": "Stream was cancelled"}
+                                break
+
+                        chunk_data = self._parse_sse_line(line)
+                        if chunk_data is not None:
+                            yield chunk_data
+        except Exception as e:
+            logger.error(f"Error in stream: {str(e)}")
+            raise
+        finally:
+            # Ensure the session is eventually closed
+            await session.close()
+
+    async def _make_async_request(
+        self,
+        endpoint: str,
+        data: Dict[str, Any],
+        headers: Optional[Dict[str, str]] = None,
+        request_body_type: str = "json",
+        serialized_body: bytes | None = None,
+    ) -> Dict[str, Any]:
+        """Make an asynchronous non-streaming HTTP request.
+
+        Args:
+            endpoint: API endpoint to call.
+            data: Request data to send.
+
+        Returns:
+            Response data.
+
+        Raises:
+            aiohttp.ClientError: If the request fails.
+        """
+        import aiohttp
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        request_headers = self.headers.copy()
+        if headers:
+            request_headers.update(headers)
+
+        if request_body_type not in {"json", "multipart"}:
+            raise ValueError(f"Unsupported request_body_type: {request_body_type}")
+
+        request_kwargs: Dict[str, Any] = {
+            "headers": request_headers,
+            "timeout": self.timeout,
+        }
+        if request_body_type == "multipart":
+            if serialized_body is not None:
+                raise ValueError("serialized_body is only valid for JSON requests")
+            request_headers.pop("Content-Type", None)
+            request_kwargs["data"] = self._build_aiohttp_form_data(data)
+        elif serialized_body is not None:
+            if not isinstance(serialized_body, bytes):
+                raise TypeError("serialized_body must be bytes or None")
+            request_kwargs["data"] = serialized_body
+        else:
+            request_kwargs["json"] = data
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                **request_kwargs,
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+
+    @staticmethod
+    def _coerce_form_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    @staticmethod
+    def _is_multipart_file_field(value: Any) -> bool:
+        return isinstance(value, dict) and "filename" in value and "content" in value
+
+    def _iter_multipart_fields(self, data: Dict[str, Any]):
+        for key, value in data.items():
+            if value is None:
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    yield key, item
+            else:
+                yield key, value
+
+    def _encode_multipart_fields(self, data: Dict[str, Any]) -> List[tuple[str, Any]]:
+        encoded: List[tuple[str, Any]] = []
+        for key, value in self._iter_multipart_fields(data):
+            if self._is_multipart_file_field(value):
+                encoded.append(
+                    (
+                        key,
+                        (
+                            value["filename"],
+                            value["content"],
+                            value.get("content_type", "application/octet-stream"),
+                        ),
+                    )
+                )
+            else:
+                encoded.append((key, (None, self._coerce_form_value(value))))
+        return encoded
+
+    def _build_aiohttp_form_data(self, data: Dict[str, Any]):
+        import aiohttp
+
+        form = aiohttp.FormData(default_to_multipart=True)
+        for key, value in self._iter_multipart_fields(data):
+            if self._is_multipart_file_field(value):
+                form.add_field(
+                    key,
+                    value["content"],
+                    filename=value["filename"],
+                    content_type=value.get("content_type", "application/octet-stream"),
+                )
+            else:
+                form.add_field(key, self._coerce_form_value(value))
+        return form
+
+    def _summarize_request_data_for_log(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        def summarize(value: Any) -> Any:
+            if self._is_multipart_file_field(value):
+                content = value.get("content", b"")
+                size_bytes = len(content) if isinstance(content, (bytes, bytearray)) else None
+                return {
+                    "filename": value.get("filename"),
+                    "content_type": value.get("content_type"),
+                    "size_bytes": size_bytes,
+                }
+            if isinstance(value, list):
+                return [summarize(item) for item in value]
+            if isinstance(value, bytes):
+                return f"<bytes:{len(value)}>"
+            if isinstance(value, dict):
+                return {k: summarize(v) for k, v in value.items()}
+            return value
+
+        return {key: summarize(value) for key, value in data.items()}
+
+    def sync_call(
+        self,
+        data: Dict[str, Any],
+        endpoint: str = None,
+        headers: Optional[Dict[str, str]] = None,
+        request_body_type: str = "json",
+        serialized_body: bytes | None = None,
+    ) -> Dict[str, Any]:
+        """Make a synchronous completion request.
+
+        Args:
+            data: Request data.
+
+        Returns:
+            Response data.
+        """
+        logger.debug(f"sync_call request data: {self._summarize_request_data_for_log(data)}")
+
+        if not endpoint:
+            endpoint = "chat/completions"
+
+        retries = 0
+        while retries < self.max_retries:
+            try:
+                response = self._make_request(
+                    endpoint,
+                    data,
+                    headers=headers,
+                    request_body_type=request_body_type,
+                    serialized_body=serialized_body,
+                )
+                return response
+            except Exception as e:
+                last_error = e
+                retries += 1
+                if retries < self.max_retries:
+                    logger.warning(f"Request failed, retrying ({retries}/{self.max_retries}): {str(e)}")
+                    # Exponential backoff with jitter
+                    backoff = min(2 ** retries + random.uniform(0, 1), 10)
+                    time.sleep(backoff)
+                else:
+                    logger.error(f"Request failed after {self.max_retries} retries: {str(e)}")
+                    raise last_error
+
+    async def async_call(
+        self,
+        data: Dict[str, Any],
+        endpoint: str = None,
+        headers: Optional[Dict[str, str]] = None,
+        request_body_type: str = "json",
+        serialized_body: bytes | None = None,
+    ) -> Dict[str, Any]:
+        """Make an asynchronous completion request.
+
+        Args:
+            data: Request data.
+
+        Returns:
+            Response data.
+        """
+        import aiohttp
+        logger.info(f"async_call request data: {self._summarize_request_data_for_log(data)}")
+
+        retries = 0
+        last_error = None
+        if not endpoint:
+            endpoint = "chat/completions"
+
+        while retries < self.max_retries:
+            try:
+                response = await self._make_async_request(
+                    endpoint,
+                    data,
+                    headers=headers,
+                    request_body_type=request_body_type,
+                    serialized_body=serialized_body,
+                )
+                return response
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_error = e
+                retries += 1
+                if retries < self.max_retries:
+                    logger.warning(f"Request failed, retrying ({retries}/{self.max_retries}): {str(e)}")
+                    # Exponential backoff with jitter
+                    backoff = min(2 ** retries + random.uniform(0, 1), 10)
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.error(f"Request failed after {self.max_retries} retries: {str(e)}")
+                    raise last_error
+
+    def sync_stream_call(
+        self,
+        data: Dict[str, Any],
+        endpoint: str = None,
+        headers: Optional[Dict[str, str]] = None,
+        serialized_body: bytes | None = None,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Make a synchronous streaming completion request.
+
+        Args:
+            data: Request data.
+
+        Yields:
+            Response chunks.
+        """
+        if data.get("stream") is not True:
+            raise ValueError("stream request must be finalized before HTTP serialization")
+        logger.info(f"sync_stream_call request data: {data}")
+        retries = 0
+
+        while retries < self.max_retries:
+            try:
+                for chunk in self._make_request(
+                    endpoint or "chat/completions", data, stream=True,
+                    headers=headers, serialized_body=serialized_body,
+                ):
+                    yield chunk
+                return  # Exit after completing stream processing
+            except Exception as e:
+                last_error = e
+                retries += 1
+                if retries < self.max_retries:
+                    logger.warning(f"Stream connection failed, retrying ({retries}/{self.max_retries}): {str(e)}")
+                else:
+                    logger.error(f"Stream connection failed after {self.max_retries} retries: {str(e)}")
+                    raise last_error
+
+
+    async def async_stream_call(
+        self,
+        data: Dict[str, Any],
+        endpoint: str = None,
+        headers: Optional[Dict[str, str]] = None,
+        serialized_body: bytes | None = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Make an asynchronous streaming completion request.
+
+        Args:
+            data: Request data.
+
+        Yields:
+            Response chunks.
+        """
+        import aiohttp
+        if data.get("stream") is not True:
+            raise ValueError("stream request must be finalized before HTTP serialization")
+        logger.info(f"async_stream_call request data: {data}")
+
+        retries = 0
+        last_error = None
+
+        while retries < self.max_retries:
+            try:
+                async for chunk in self._make_async_request_stream(
+                    endpoint or "chat/completions", data, headers=headers,
+                    serialized_body=serialized_body,
+                ):
+                    yield chunk
+                return  # Exit after completing stream processing
+            except (aiohttp.ClientError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
+                last_error = e
+                retries += 1
+                if retries < self.max_retries:
+                    # Exponential backoff with jitter
+                    backoff = min(2 ** retries + random.uniform(0, 1), 10)
+                    logger.warning(f"Stream connection failed, retrying in {backoff:.1f}s ({retries}/{self.max_retries}): {str(e)}")
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.error(f"Stream connection failed after {self.max_retries} retries: {str(e)}")
+                    raise last_error

@@ -1,0 +1,603 @@
+"""
+Continuous execution executor for running agents in a loop.
+"""
+import asyncio
+import json
+import sys
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Union, List
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from aworld.utils.serialized_util import to_serializable
+from .base import AgentExecutor
+from .._globals import console as global_console
+
+
+class ContinuousExecutor:
+    """
+    Continuous executor that runs agent tasks in a loop with various limits.
+    
+    Example:
+        >>> executor = ContinuousExecutor(agent_executor, console)
+        >>> await executor.run_continuous(
+        ...     prompt="add unit tests",
+        ...     max_runs=5,
+        ...     max_duration="2h"
+        ... )
+    """
+    
+    def __init__(self, agent_executor: AgentExecutor, console: Optional[Console] = None):
+        """
+        Initialize continuous executor.
+        
+        Args:
+            agent_executor: Agent executor instance
+            console: Rich console for output. If None, uses global console.
+        """
+        self.agent_executor = agent_executor
+        # Use global console if not provided
+        self.console = console if console is not None else global_console
+        self.total_cost: float = 0.0
+        self.start_time: Optional[datetime] = None
+
+    @staticmethod
+    def _attach_task_response_evidence(
+        result: Dict[str, Any],
+        task_response: Any,
+        *,
+        include_control_plane: bool = True,
+    ) -> Dict[str, Any]:
+        """Attach trajectory control/data planes even when either is empty.
+
+        Failed runs frequently have an empty inline trajectory but a populated
+        LLM journal or TrajectoryBuildResult.  Gating all evidence on a non-empty
+        trajectory loses the exact counters needed by failure-safe exporters.
+        """
+
+        if task_response is None:
+            return result
+        result["trajectory_capture_mode"] = "task_response"
+
+        trajectory = getattr(task_response, "trajectory", None)
+        if isinstance(trajectory, list):
+            result["trajectory"] = to_serializable(trajectory)
+
+        llm_calls = getattr(task_response, "llm_calls", None)
+        if isinstance(llm_calls, list):
+            result["llm_calls"] = to_serializable(llm_calls)
+
+        for attribute in (
+            "trajectory_build_result",
+            "trajectory_delivery_receipt",
+        ):
+            record = getattr(task_response, attribute, None)
+            if record is None:
+                continue
+            to_dict = getattr(record, "to_dict", None)
+            result[attribute] = to_serializable(
+                to_dict() if callable(to_dict) else record
+            )
+
+        if include_control_plane:
+            task_status = getattr(task_response, "status", None)
+            if task_status is not None:
+                result["task_status"] = to_serializable(task_status)
+            for attribute in ("failure_origin", "failure_code", "error_type", "semantic_status", "completion_reason"):
+                value = getattr(task_response, attribute, None)
+                if isinstance(value, str) and value:
+                    result[attribute] = value
+            recoverable = getattr(task_response, "recoverable", None)
+            if isinstance(recoverable, bool):
+                result["recoverable"] = recoverable
+            if result.get("failure_origin") == "cancelled" or result.get(
+                "task_status"
+            ) in {"cancelled", "interrupted"}:
+                result["termination_status"] = "cancelled"
+        return result
+
+    def _active_steering_runtime(self, *, non_interactive: bool) -> Any | None:
+        if non_interactive or not sys.stdin.isatty():
+            return None
+
+        runtime = getattr(self.agent_executor, "_base_runtime", None)
+        cli = getattr(runtime, "cli", None) if runtime is not None else None
+        if cli is None:
+            return None
+        if not callable(getattr(cli, "_build_session_completer", None)):
+            return None
+        if not callable(getattr(cli, "_run_executor_with_active_steering", None)):
+            return None
+        return runtime
+        
+    def _parse_duration(self, duration_str: str) -> timedelta:
+        """
+        Parse duration string like "2h", "30m", "1h30m" into timedelta.
+        
+        Args:
+            duration_str: Duration string (e.g., "2h", "30m", "1h30m")
+            
+        Returns:
+            Parsed timedelta object
+            
+        Example:
+            >>> executor._parse_duration("2h")
+            datetime.timedelta(seconds=7200)
+        """
+        duration_str = duration_str.lower().strip()
+        total_seconds = 0
+        
+        # Parse hours
+        if 'h' in duration_str:
+            parts = duration_str.split('h', 1)
+            hours = int(parts[0])
+            total_seconds += hours * 3600
+            duration_str = parts[1] if len(parts) > 1 else ""
+        
+        # Parse minutes
+        if 'm' in duration_str:
+            parts = duration_str.split('m', 1)
+            minutes = int(parts[0])
+            total_seconds += minutes * 60
+        
+        return timedelta(seconds=total_seconds)
+    
+    def _check_duration_limit(self, max_duration: Optional[str]) -> bool:
+        """
+        Check if duration limit has been reached.
+        
+        Args:
+            max_duration: Maximum duration string (e.g., "2h")
+            
+        Returns:
+            True if limit reached, False otherwise
+        """
+        if not max_duration or not self.start_time:
+            return False
+        
+        duration_limit = self._parse_duration(max_duration)
+        elapsed = datetime.now() - self.start_time
+        return elapsed >= duration_limit
+    
+    def _check_cost_limit(self, max_cost: Optional[float]) -> bool:
+        """
+        Check if cost limit has been reached.
+        
+        Args:
+            max_cost: Maximum cost in USD
+            
+        Returns:
+            True if limit reached, False otherwise
+        """
+        if max_cost is None:
+            return False
+        return self.total_cost >= max_cost
+
+    @staticmethod
+    def _trajectory_establishes_completion(trajectory: Any) -> bool:
+        """Return whether the authoritative action ledger ends terminally.
+
+        A ``TaskResponse`` trajectory can contain transport placeholders such
+        as ``content=None`` after a real action.  Those entries are not agent
+        turns.  Conversely, a terminal text action followed by another tool
+        action is no longer terminal.  Use the last meaningful action so the
+        continuous runner stops exactly when the agent declares completion,
+        instead of relying on response-text heuristics.
+        """
+
+        if not isinstance(trajectory, list) or not trajectory:
+            return False
+        last_meaningful_action: Dict[str, Any] | None = None
+        for step in trajectory:
+            if not isinstance(step, dict):
+                continue
+            action = step.get("action")
+            if not isinstance(action, dict):
+                continue
+            content = action.get("content")
+            meaningful_content = bool(
+                isinstance(content, str)
+                and content.strip()
+                and content.strip().casefold() not in {"none", "null"}
+            )
+            tool_calls = action.get("tool_calls")
+            has_tool_calls = bool(
+                isinstance(tool_calls, (list, tuple)) and tool_calls
+            )
+            if meaningful_content or has_tool_calls:
+                last_meaningful_action = action
+        if last_meaningful_action is None:
+            return False
+        finished = last_meaningful_action.get("is_agent_finished")
+        terminal = finished is True or (
+            isinstance(finished, str)
+            and finished.strip().casefold() == "true"
+        )
+        tool_calls = last_meaningful_action.get("tool_calls")
+        return bool(
+            terminal
+            and not (isinstance(tool_calls, (list, tuple)) and tool_calls)
+        )
+
+    async def run_iteration(
+        self,
+        iteration: int,
+        prompt: Union[str, tuple[str, List[str]]],
+        completion_signal: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        show_iteration_header: bool = True,
+        **chat_kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Run a single iteration.
+        
+        Args:
+            iteration: Current iteration number
+            prompt: Task prompt (string or multimodal content list)
+            completion_signal: Signal phrase that indicates completion
+            
+        Returns:
+            Dictionary with iteration results including response, cost, and completion status
+        """
+
+        session_id = getattr(self.agent_executor, 'session_id', 'unknown')
+        previous_task_response = getattr(
+            self.agent_executor,
+            "last_task_response",
+            None,
+        )
+        if show_iteration_header:
+            self.console.print(f"\n[bold cyan]🔄({iteration}) Starting iteration  session: {session_id}[/bold cyan]")
+        
+        try:
+            # Ensure agent_executor uses the same console for output rendering
+            # Use global console to ensure consistent output
+            # This MUST be set before calling chat() to ensure output is displayed
+            if hasattr(self.agent_executor, 'console'):
+                # Force set to global console to ensure output is displayed
+                self.agent_executor.console = global_console
+                # Verify it was set correctly
+                if self.agent_executor.console is not global_console:
+                    self.console.print("[yellow]⚠️ Warning: Failed to set agent_executor.console[/yellow]")
+            
+            non_interactive = bool(chat_kwargs.pop("non_interactive", False))
+            runtime = self._active_steering_runtime(non_interactive=non_interactive)
+            if runtime is not None:
+                cli = runtime.cli
+                completer = cli._build_session_completer(
+                    agent_names=[agent_name] if agent_name else [],
+                    agent_name=agent_name,
+                    executor_instance=self.agent_executor,
+                    runtime=runtime,
+                    event_loop=asyncio.get_running_loop(),
+                )
+
+                async def _run_prompt(text: str):
+                    return await self.agent_executor.chat(text, **chat_kwargs)
+
+                response = await cli._run_executor_with_active_steering(
+                    prompt=prompt,
+                    executor=_run_prompt,
+                    completer=completer,
+                    runtime=runtime,
+                    agent_name=agent_name or "Aworld",
+                    executor_instance=self.agent_executor,
+                    is_terminal=True,
+                )
+            else:
+                response = await self.agent_executor.chat(prompt, **chat_kwargs)
+
+            task_response = getattr(self.agent_executor, "last_task_response", None)
+            trajectory = getattr(task_response, "trajectory", None)
+            trajectory_completed = self._trajectory_establishes_completion(
+                trajectory
+            )
+
+            # Check for completion signal (only check if response is string)
+            is_complete = False
+            if completion_signal and isinstance(response, str) and completion_signal.lower() in response.lower():
+                is_complete = True
+                self.console.print(f"[green]✅ ({iteration}) Completion signal detected![/green]")
+
+            # A runtime completion record or a caller-selected completion signal
+            # can finish a run. Repeated/substantial prose is not verification.
+            task_response = getattr(self.agent_executor, "last_task_response", None)
+            semantic_status = getattr(task_response, "semantic_status", None)
+            if semantic_status is not None:
+                is_complete = semantic_status == "succeeded"
+            elif task_response is not None:
+                is_complete = is_complete or (
+                    getattr(task_response, "success", False) is True
+                    and getattr(task_response, "status", None) in {"finished", "success"}
+                )
+            if semantic_status is None and trajectory_completed and not non_interactive:
+                is_complete = True
+                self.console.print(
+                    f"[green]✅ ({iteration}) Task completed - terminal "
+                    "TaskResponse action observed![/green]"
+                )
+
+            # TODO: Extract actual cost from response if available
+            # For now, we'll use a placeholder
+            cost = 0.0  # This should be extracted from the actual response
+
+            self.console.print(f"[dim]💰 ({iteration}) Cost: ${cost:.3f}[/dim]")
+
+            task_response = getattr(self.agent_executor, "last_task_response", None)
+            task_interrupted = bool(
+                getattr(self.agent_executor, "last_task_interrupted", False)
+            )
+            task_succeeded = (
+                False
+                if task_interrupted
+                else getattr(task_response, "success", None)
+            )
+            if semantic_status in {"incomplete", "budget_exhausted"}:
+                task_succeeded = False
+            if task_succeeded is None:
+                task_succeeded = not (
+                    isinstance(response, str)
+                    and response.strip().lower().startswith("task fail, cause:")
+                )
+
+            result = {
+                "iteration": iteration,
+                "response": response,
+                "cost": cost,
+                "completed": is_complete and bool(task_succeeded),
+                # A terminal TaskResponse is authoritative at every iteration,
+                # but a failed or interrupted task must never become success.
+                "immediate_stop": bool(task_succeeded) and (
+                    trajectory_completed or (is_complete and iteration == 1)
+                ),
+                "success": bool(task_succeeded),
+            }
+            if task_interrupted:
+                result["termination_status"] = "cancelled"
+            activation_evidence = getattr(
+                self.agent_executor,
+                "last_skill_activation_evidence",
+                (),
+            )
+            if activation_evidence:
+                result["skill_activation_evidence"] = to_serializable(
+                    activation_evidence
+                )
+            llm_usage = getattr(self.agent_executor, "last_llm_usage", None)
+            if (
+                isinstance(llm_usage, dict)
+                and llm_usage.get("coverage_complete") is True
+                and llm_usage.get("ledger_consistent") is True
+            ):
+                result["llm_usage"] = to_serializable(llm_usage)
+            return self._attach_task_response_evidence(result, task_response)
+            
+        except Exception as e:
+            self.console.print(f"[red]❌ ({iteration}) Error: {e}[/red]")
+            task_response = getattr(self.agent_executor, "last_task_response", None)
+            fresh_task_response = (
+                task_response is not None
+                and task_response is not previous_task_response
+            )
+            response_failure_origin = (
+                getattr(task_response, "failure_origin", None)
+                if fresh_task_response
+                else None
+            )
+            failure_origin = (
+                response_failure_origin
+                if response_failure_origin in {"task", "infrastructure", "cancelled"}
+                else ("task" if fresh_task_response else "infrastructure")
+            )
+            failure_code = (
+                getattr(task_response, "failure_code", None)
+                if fresh_task_response
+                else None
+            ) or ("runtime_exception" if fresh_task_response else "executor_exception")
+            error_type = (
+                getattr(task_response, "error_type", None)
+                if fresh_task_response
+                else None
+            ) or type(e).__name__
+            diagnostic = {
+                "schema_version": "aworld.executor.exception.v1",
+                "iteration": iteration,
+                "fresh_task_response": fresh_task_response,
+                "failure_origin": failure_origin,
+                "failure_code": failure_code,
+                "error_type": error_type,
+                "task_status": (
+                    getattr(task_response, "status", None)
+                    if fresh_task_response
+                    else None
+                ),
+                "semantic_status": (
+                    getattr(task_response, "semantic_status", None)
+                    if fresh_task_response
+                    else None
+                ),
+            }
+            print(
+                "AWORLD_EXECUTOR_EXCEPTION="
+                + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True),
+                file=sys.stderr,
+            )
+            result = {
+                "iteration": iteration,
+                "response": (
+                    getattr(task_response, "answer", None)
+                    if fresh_task_response
+                    else str(e)
+                ) or "Task ended before a final answer was produced.",
+                "cost": 0.0,
+                "completed": False,
+                "success": False,
+                "failure_origin": failure_origin,
+                "failure_code": failure_code,
+                "error_type": error_type,
+            }
+            return self._attach_task_response_evidence(
+                result,
+                task_response,
+                include_control_plane=fresh_task_response,
+            )
+    
+    async def run_continuous(
+        self,
+        prompt: Union[str, tuple[str, List[str]]],
+        agent_name: str,
+        max_runs: Optional[int] = None,
+        max_cost: Optional[float] = None,
+        max_duration: Optional[str] = None,
+        completion_signal: Optional[str] = None,
+        completion_threshold: int = 3,
+        show_start_banner: bool = True,
+        show_iteration_header: bool = True,
+        echo_prompt_as_turn: bool = False,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Run agent tasks continuously with various limits.
+        
+        Args:
+            prompt: Task prompt for the agent (string or tuple of (text, image_urls) for multimodal)
+            agent_name: Name of the agent
+            max_runs: Maximum number of iterations (0 for infinite)
+            max_cost: Maximum cost in USD
+            max_duration: Maximum duration (e.g., "2h", "30m", "1h30m")
+            completion_signal: Signal phrase that indicates completion
+            completion_threshold: Number of consecutive completion signals required
+            **kwargs: Additional arguments passed to agent executor
+            
+        Returns:
+            Summary dictionary with total runs, cost, and results
+            
+        Example:
+            >>> await executor.run_continuous(
+            ...     prompt="add unit tests",
+            ...     agent_name="TestAgent",
+            ...     max_runs=5,
+            ...     max_duration="2h"
+            ... )
+        """
+        self.start_time = datetime.now()
+        self.total_cost = 0.0
+        
+        # Format prompt for display
+        if isinstance(prompt, tuple):
+            prompt_text, image_urls = prompt
+            image_count = len(image_urls) if image_urls else 0
+            prompt_display = prompt_text
+            if image_count > 0:
+                prompt_display += f" [📷 {image_count} image(s)]"
+        else:
+            prompt_display = prompt
+        
+        if echo_prompt_as_turn:
+            self.console.print(f"You: {prompt_display}")
+            self.console.print()
+
+        if show_start_banner:
+            # Display start banner with adaptive layout
+            start_table = Table(show_header=False, box=None, padding=(0, 1))
+            start_table.add_column("Label", style="bold", no_wrap=True)
+            start_table.add_column("Value", style="cyan")
+
+            start_table.add_row("Mode", "Continuous Execution")
+            start_table.add_row("Agent", f"[cyan]{agent_name}[/cyan]")
+            start_table.add_row("Prompt", f"[yellow]{prompt_display}[/yellow]")
+            start_table.add_row("Max Runs", str(max_runs if max_runs else '∞'))
+            start_table.add_row("Max Cost", f"${max_cost if max_cost else '∞'}")
+            start_table.add_row("Max Duration", str(max_duration if max_duration else '∞'))
+
+            self.console.print(Panel(
+                start_table,
+                title="🚀 Starting",
+                border_style="blue",
+                expand=False
+            ))
+        
+        iteration = 0
+        consecutive_completions = 0
+        results = []
+        
+        try:
+            while True:
+                # Check limits before incrementing iteration
+                if max_runs is not None and max_runs > 0 and iteration >= max_runs:
+                    self.console.print(f"\n[yellow]⏸️  Max runs ({max_runs}) reached.[/yellow]")
+                    break
+                
+                iteration += 1
+                
+                if self._check_cost_limit(max_cost):
+                    self.console.print(f"\n[yellow]⏸️  Max cost (${max_cost:.2f}) reached.[/yellow]")
+                    break
+                
+                if self._check_duration_limit(max_duration):
+                    self.console.print(f"\n[yellow]⏸️  Max duration ({max_duration}) reached.[/yellow]")
+                    break
+                
+                # Run iteration
+                result = await self.run_iteration(
+                    iteration,
+                    prompt,
+                    completion_signal,
+                    agent_name=agent_name,
+                    show_iteration_header=show_iteration_header,
+                    **kwargs,
+                )
+                results.append(result)
+
+                self.total_cost += result["cost"]
+
+                # Check for immediate stop (first iteration with definitive answer)
+                if result.get("immediate_stop", False):
+                    self.console.print("\n[green]🎉 Task completed successfully![/green]")
+                    break
+
+                # Check completion signal
+                if result["completed"]:
+                    consecutive_completions += 1
+                    if consecutive_completions >= completion_threshold:
+                        self.console.print(f"\n[green]🎉 Project complete! ({consecutive_completions} consecutive completion signals)[/green]")
+                        break
+                else:
+                    consecutive_completions = 0
+                
+                # Small delay between iterations
+                await asyncio.sleep(1)
+                
+        except KeyboardInterrupt:
+            self.console.print("\n[yellow]⚠️  Interrupted by user.[/yellow]")
+        
+        # Display summary with adaptive width using Table for better terminal compatibility
+        elapsed = datetime.now() - self.start_time if self.start_time else timedelta(0)
+        successful_runs = sum(1 for r in results if r["success"])
+
+        # Use Table instead of Panel for better width control across different terminal sizes
+        # This auto-fits content width without excessive stretching or wrapping
+        summary_table = Table(show_header=False, box=None, padding=(0, 2), collapse_padding=True)
+        summary_table.add_column("Label", style="bold")
+        summary_table.add_column("Value")
+
+        summary_table.add_row("📊", "[bold green]Execution Summary[/bold green]")
+        summary_table.add_row("Total Iterations", str(iteration))
+        summary_table.add_row("Successful", f"[green]{successful_runs}[/green]")
+        summary_table.add_row("Failed", f"[red]{iteration - successful_runs}[/red]" if iteration - successful_runs > 0 else "0")
+        summary_table.add_row("Total Cost", f"[yellow]${self.total_cost:.3f}[/yellow]")
+        summary_table.add_row("Duration", f"[cyan]{elapsed}[/cyan]")
+
+        self.console.print("\n")  # Add spacing
+        self.console.print(summary_table)
+        self.console.print("")  # Add spacing
+        
+        return {
+            "total_runs": iteration,
+            "successful_runs": successful_runs,
+            "total_cost": self.total_cost,
+            "duration": elapsed,
+            "results": results
+        }
+
+__all__ = ["ContinuousExecutor"]

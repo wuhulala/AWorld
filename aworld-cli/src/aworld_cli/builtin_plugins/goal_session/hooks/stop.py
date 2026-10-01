@@ -1,0 +1,204 @@
+from aworld_cli.core.command_system import CommandContext
+from aworld_cli.plugin_capabilities.commands import PluginBoundCommand
+
+from aworld_cli.builtin_plugins.goal_session.common import (
+    parse_goal_args,
+    resolve_goal_control_action,
+)
+from aworld_cli.builtin_plugins.goal_session.hooks.task_completed import (
+    _persistable_state,
+    build_goal_context_prompt,
+    goal_status,
+    is_goal_active,
+    new_goal_contract_state,
+)
+
+
+class GoalCommand(PluginBoundCommand):
+    @property
+    def command_type(self) -> str:
+        return "prompt"
+
+    def resolve_command_type(self, context: CommandContext) -> str:
+        if resolve_goal_control_action(context.user_args) == "resume":
+            return "prompt"
+        if resolve_goal_control_action(context.user_args):
+            return "tool"
+        return "prompt"
+
+    def should_start_new_session(self, context: CommandContext) -> bool:
+        return resolve_goal_control_action(context.user_args) is None
+
+    async def pre_execute(self, context: CommandContext):
+        if resolve_goal_control_action(context.user_args) == "resume":
+            handle = self.get_state_handle(context)
+            current = handle.read() if handle else {}
+            if goal_status(current) not in {"paused", "active"}:
+                return "Only a paused or active goal can resume; a reached attempt limit requires an explicit new goal."
+            maximum = current.get("max_turns")
+            if maximum is not None and current.get("turn_count", 1) >= maximum:
+                handle.update({"active": False, "status": "budget_limited"})
+                return "The goal's maximum number of attempts was reached. Resume does not reset it."
+        if resolve_goal_control_action(context.user_args):
+            return None
+        try:
+            parse_goal_args(context.user_args)
+        except ValueError as exc:
+            return f"/goal error: {exc}"
+        if self.get_state_handle(context) is None:
+            return "/goal requires session-aware plugin state"
+        return None
+
+    def _build_start_state(self, context: CommandContext) -> dict:
+        parsed = parse_goal_args(context.user_args)
+        handle = self.get_state_handle(context)
+        if handle is None:
+            raise ValueError("/goal requires session-aware plugin state")
+        if parsed["from_campaign"]:
+            state = self._campaign_goal_state(
+                context,
+                parsed["from_campaign"],
+                max_turns=parsed["max_turns"],
+            )
+        else:
+            state = new_goal_contract_state(
+                objective=parsed["prompt"],
+                verification_commands=parsed["verify_commands"],
+                completion_promise=parsed["completion_promise"],
+                max_turns=parsed["max_turns"],
+                source="goal",
+            )
+        handle.write(state)
+        return state
+
+    def _campaign_goal_state(
+        self,
+        context: CommandContext,
+        campaign_id: str,
+        *,
+        max_turns: int | None,
+    ) -> dict:
+        from aworld.self_evolve.campaign import (
+            SelfImprovementCampaignStatus,
+            SelfImprovementDispositionKind,
+        )
+        from aworld.self_evolve.store import FilesystemSelfEvolveStore
+
+        store = FilesystemSelfEvolveStore(context.cwd)
+        campaign = store.read_campaign(campaign_id)
+        if campaign.status is not SelfImprovementCampaignStatus.PAUSED:
+            raise ValueError("campaign must be paused at a Goal handoff")
+        disposition = campaign.latest_disposition
+        if (
+            disposition is None
+            or disposition.kind is not SelfImprovementDispositionKind.HANDOFF_GOAL
+        ):
+            raise ValueError("campaign does not contain a framework/shared Goal handoff")
+        handoff = store.read_campaign_goal_handoff(campaign_id)
+        if handoff.get("schema_version") != "aworld.self_evolve.goal_handoff.v1":
+            raise ValueError("unsupported campaign Goal handoff schema")
+        if handoff.get("latest_run_id") != campaign.run_ids[-1]:
+            raise ValueError("campaign Goal handoff does not match latest run")
+        resume_action = f"aworld-cli optimize --resume-campaign {campaign_id}"
+        if handoff.get("next_action") != resume_action:
+            raise ValueError("campaign Goal handoff has an invalid resume action")
+        state = new_goal_contract_state(
+            objective=str(handoff.get("objective") or ""),
+            max_turns=max_turns,
+            source="self_evolve",
+        )
+        state.update(
+            {
+                "campaign_id": campaign_id,
+                "campaign_handoff_path": str(
+                    store.campaign_path(campaign_id) / "goal_handoff.json"
+                ),
+                "latest_run_id": campaign.run_ids[-1],
+                "campaign_resume_action": resume_action,
+            }
+        )
+        return state
+
+    async def execute(self, context: CommandContext) -> str:
+        action = resolve_goal_control_action(context.user_args)
+        if action is None:
+            try:
+                state = self._build_start_state(context)
+            except ValueError as exc:
+                return f"/goal error: {exc}"
+            return build_goal_context_prompt(state)
+
+        handle = self.get_state_handle(context)
+        if handle is None:
+            return "Goal session state is unavailable."
+
+        current = handle.read()
+
+        if action == "status":
+            if goal_status(current) == "none":
+                return "No active goal."
+            return build_goal_context_prompt(current)
+
+        if action == "pause":
+            if not is_goal_active(current):
+                return "No active goal to pause."
+            updated = handle.update(
+                {
+                    "active": False,
+                    "status": "paused",
+                    "last_task_status": "paused",
+                }
+            )
+            if context.executor is not None and hasattr(context.executor, "request_goal_pause"):
+                context.executor.request_goal_pause()
+            return build_goal_context_prompt(updated)
+
+        if action == "resume":
+            if goal_status(current) not in {"paused", "active"}:
+                return "Only a paused or active goal can resume; a reached attempt limit cannot be reset by resume."
+            maximum = current.get("max_turns")
+            if maximum is not None and current.get("turn_count", 1) >= maximum:
+                return build_goal_context_prompt(handle.update({"active": False, "status": "budget_limited"}))
+            if context.executor is not None and current.get("last_task_id"):
+                context.executor._resume_context_checkpoint_once = True
+                context.executor._resume_goal_work_scope_once = {
+                    "source_task_id": current["last_task_id"],
+                    "source_task_epoch": current.get("last_task_epoch"),
+                }
+                context.executor._resume_goal_agent_ids_once = current.get("agent_ids_by_name") or {}
+            updated = _persistable_state({**current,
+                "active": True, "status": "active",
+                "turn_count": current.get("turn_count", 1) + 1,
+            })
+            handle.write(updated)
+            return build_goal_context_prompt(updated)
+
+        if action == "clear":
+            if not current:
+                return "No goal state to clear."
+            handle.clear()
+            if context.executor is not None and hasattr(context.executor, "request_goal_pause"):
+                context.executor.request_goal_pause()
+            return "Goal cleared."
+
+        return "Unknown /goal action."
+
+    async def get_prompt(self, context: CommandContext) -> str:
+        if resolve_goal_control_action(context.user_args) == "resume":
+            return await self.execute(context)
+        state = self._build_start_state(context)
+        return build_goal_context_prompt(state)
+
+
+def handle_event(event, state):
+    if not is_goal_active(state):
+        return {"action": "allow"}
+
+    return {
+        "action": "deny",
+        "reason": "An active goal is still in progress. Use /goal pause to keep it for later or /goal clear to discard it before exiting.",
+    }
+
+
+def build_command(plugin, entrypoint):
+    return GoalCommand(plugin, entrypoint)

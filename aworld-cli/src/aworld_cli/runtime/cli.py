@@ -1,0 +1,591 @@
+"""
+CLI runtime that supports agents from multiple sources (plugins, local, remote).
+
+Uses composition pattern with abstract loaders to follow unified lifecycle:
+1. Load plugins (skills + agents) - Load phase
+2. Load local agents - Load phase
+3. Load remote agents - Load phase
+4. Create executors - Run phase (handled here)
+
+Load and Run are separated:
+- Loaders: Only responsible for loading agents (load phase)
+- Runtime: Responsible for creating executors and running (run phase)
+"""
+import os
+from datetime import datetime
+from typing import List, Optional, Dict
+from pathlib import Path
+from .base import BaseCliRuntime
+from .loaders import AgentLoader, PluginLoader, LocalAgentLoader, RemoteAgentLoader
+from ..models import AgentInfo
+from ..executors import AgentExecutor
+from ..executors.local import LocalAgentExecutor
+from ..executors.remote import RemoteAgentExecutor
+from ..core.session_restore import restore_session_to_executor
+from ..core.session_store import CliSessionRecord, CliSessionStore
+from ..core.agent_registry import LocalAgentRegistry
+from aworld.core.context.amni import ApplicationContext, TaskInput
+from aworld.core.context.amni.config import AmniConfigFactory, AmniConfigLevel
+
+
+def _safe_getattr(target, name: str, default=None):
+    try:
+        return getattr(target, name)
+    except Exception:
+        return default
+
+
+def _append_agent_like(items: list, candidate) -> None:
+    if candidate is None:
+        return
+    if isinstance(candidate, (list, tuple, set)):
+        for item in candidate:
+            _append_agent_like(items, item)
+        return
+    if isinstance(candidate, dict):
+        for item in candidate.values():
+            _append_agent_like(items, item)
+        return
+    if getattr(candidate, "conf", None) is not None:
+        items.append(candidate)
+
+
+def _iter_swarm_config_agents(swarm) -> list:
+    agents = []
+    # Do not access Swarm.agents or Swarm.ordered_agents here: those properties
+    # lazily reset uninitialized swarms before the real task/context/tools exist.
+    swarm_state = getattr(swarm, "__dict__", {}) if swarm is not None else {}
+    if isinstance(swarm_state, dict):
+        _append_agent_like(agents, swarm_state.get("_communicate_agent"))
+        _append_agent_like(agents, swarm_state.get("topology"))
+        _append_agent_like(agents, swarm_state.get("register_agents"))
+        agent_graph = swarm_state.get("agent_graph")
+        if agent_graph is not None:
+            _append_agent_like(agents, getattr(agent_graph, "root_agent", None))
+            _append_agent_like(agents, getattr(agent_graph, "ordered_agents", None))
+            _append_agent_like(agents, getattr(agent_graph, "agents", None))
+        builder = swarm_state.get("builder")
+        if builder is not None:
+            _append_agent_like(agents, getattr(builder, "root_agent", None))
+
+    if not agents:
+        _append_agent_like(agents, swarm)
+
+    unique = []
+    seen = set()
+    for agent in agents:
+        key = id(agent)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(agent)
+    return unique
+
+
+def _apply_self_evolve_config_to_swarm(swarm, self_evolve_config) -> None:
+    if self_evolve_config is None or swarm is None:
+        return
+    for agent in _iter_swarm_config_agents(swarm):
+        conf = getattr(agent, "conf", None)
+        if conf is None:
+            continue
+        try:
+            conf.self_evolve_config = self_evolve_config
+        except Exception:
+            continue
+
+
+def _apply_runtime_skill_paths_to_swarm(
+    swarm,
+    skill_paths: tuple[str, ...],
+    isolated_candidate_skill_paths: tuple[str, ...] = (),
+) -> None:
+    """Expose explicit CLI skill sources to task-time skill resolution."""
+
+    if not skill_paths or swarm is None:
+        return
+    for agent in _iter_swarm_config_agents(swarm):
+        conf = getattr(agent, "conf", None)
+        if conf is None:
+            continue
+        ext = dict(getattr(conf, "ext", None) or {})
+        resolver_inputs = dict(ext.get("skill_resolver_inputs", {}) or {})
+        sources = [
+            str(item)
+            for item in resolver_inputs.get("compatibility_sources", [])
+            if str(item).strip()
+        ]
+        for skill_path in skill_paths:
+            if skill_path not in sources:
+                sources.append(skill_path)
+        resolver_inputs["compatibility_sources"] = sources
+        isolated_sources = [
+            str(item)
+            for item in resolver_inputs.get("isolated_candidate_sources", [])
+            if str(item).strip()
+        ]
+        for skill_path in isolated_candidate_skill_paths:
+            if skill_path not in isolated_sources:
+                isolated_sources.append(skill_path)
+        if isolated_sources:
+            resolver_inputs["isolated_candidate_sources"] = isolated_sources
+        ext["skill_resolver_inputs"] = resolver_inputs
+        conf.ext = ext
+
+
+class CliRuntime(BaseCliRuntime):
+    """
+    CLI runtime that supports agents from multiple sources.
+    
+    Supports plugins, local directories, and remote backends.
+    No distinction between local and remote - unified lifecycle.
+    
+    Uses composition pattern with abstract loaders:
+    - PluginLoader: Loads plugins (skills + agents) - Load phase
+    - LocalAgentLoader: Loads local agents - Load phase
+    - RemoteAgentLoader: Loads remote agents - Load phase
+    - CliRuntime: Creates executors - Run phase
+    
+    Unified lifecycle:
+    1. Load plugins (for each plugin: load skills, then load agents)
+    2. Load local agents
+    3. Load remote agents
+    4. Create executors (when needed, based on agent source type)
+    
+    Configuration:
+        LOCAL_AGENTS_DIR: Semicolon-separated list of local directories
+        REMOTE_AGENT_BACKEND: Semicolon-separated list of remote backend URLs
+        
+    Example:
+        >>> runtime = CliRuntime()
+        >>> await runtime.start()
+    """
+    
+    def __init__(
+        self,
+        agent_name: Optional[str] = None,
+        remote_backends: Optional[List[str]] = None,
+        local_dirs: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        disable_live_display: bool = False,
+        resume_record: CliSessionRecord | None = None,
+        session_store: CliSessionStore | None = None,
+        require_same_resume_agent: bool = True,
+        resume_cwd: str | None = None,
+        fail_on_missing_agent: bool = False,
+        self_evolve_config=None,
+        skill_paths: Optional[List[str]] = None,
+    ):
+        """
+        Initialize CLI Runtime.
+
+        Args:
+            agent_name: The name of the agent to interact with. If None, user will be prompted to select.
+            remote_backends: Optional list of remote backend URLs (overrides environment variables)
+            local_dirs: Optional list of local agent directories (overrides environment variables)
+            session_id: Optional session ID to use when creating executors
+            disable_live_display: If True, remote executors will not use Rich Status/Live
+                (for batch/concurrent mode to avoid "Only one live display may be active at once")
+            resume_record: Optional session record to restore into created executors
+            session_store: Store that owns resume_record
+            require_same_resume_agent: Whether restored executor must use record.agent_name
+            resume_cwd: Current cwd used for explicit cross-workspace warnings
+            fail_on_missing_agent: Return without selecting a fallback agent when agent_name is unavailable
+        """
+        super().__init__(agent_name)
+        self._parse_config(remote_backends, local_dirs)
+
+        # Track agent sources for executor creation: agent_name -> {type, location, ...}
+        self._agent_sources: Dict[str, Dict] = {}
+        self._agent_load_failures: List[Dict[str, str]] = []
+        # Store session_id for executor creation
+        self._session_id = session_id
+        self._disable_live_display = disable_live_display
+        self._resume_record = resume_record
+        self._session_store = session_store
+        self._require_same_resume_agent = require_same_resume_agent
+        self._resume_cwd = resume_cwd
+        self._fail_on_missing_agent = fail_on_missing_agent
+        self._self_evolve_config = self_evolve_config
+        self.runtime_skill_paths = tuple(
+            dict.fromkeys(
+                str(Path(item).expanduser().resolve())
+                for item in skill_paths or ()
+                if str(item).strip()
+            )
+        )
+        isolated_candidate_roots = os.getenv(
+            "AWORLD_SELF_EVOLVE_ISOLATED_SKILL_ROOTS", ""
+        )
+        requested_isolated_paths = {
+            str(Path(item).expanduser().resolve())
+            for item in isolated_candidate_roots.split(os.pathsep)
+            if item.strip()
+        }
+        # Only explicit --skill-path roots can be promoted to the isolated
+        # candidate lane.  An ambient environment variable cannot expose an
+        # arbitrary unpublished package by itself.
+        self.isolated_candidate_skill_paths = tuple(
+            item
+            for item in self.runtime_skill_paths
+            if item in requested_isolated_paths
+        )
+    
+    def _parse_config(
+        self, 
+        remote_backends: Optional[List[str]] = None,
+        local_dirs: Optional[List[str]] = None
+    ):
+        """
+        Parse configuration from environment variables or provided parameters.
+        
+        Args:
+            remote_backends: Optional list of remote backend URLs (overrides environment variables)
+            local_dirs: Optional list of local agent directories (overrides environment variables)
+        """
+        # Get framework plugin directories and built-in agent bundle directories.
+        self.plugin_dirs = self._get_plugin_dirs()
+        self.builtin_agent_dirs = self._get_builtin_agent_dirs()
+        
+        # Parse local directories
+        if local_dirs:
+            self.local_dirs = [d.strip() for d in local_dirs]
+        else:
+            local_dirs_str = os.getenv("LOCAL_AGENTS_DIR") or os.getenv("AGENTS_DIR") or ""
+            self.local_dirs = [d.strip() for d in local_dirs_str.split(";") if d.strip()]
+        
+        # Parse remote backends
+        if remote_backends:
+            self.remote_backends = [b.strip().rstrip("/") for b in remote_backends]
+        else:
+            remote_backends_str = os.getenv("REMOTE_AGENT_BACKEND") or os.getenv("REMOTE_AGENTS_BACKEND") or ""
+            self.remote_backends = [b.strip().rstrip("/") for b in remote_backends_str.split(";") if b.strip()]
+        
+        # If no config, use current working directory as default
+        if (
+            not self.plugin_dirs
+            and not self.builtin_agent_dirs
+            and not self.local_dirs
+            and not self.remote_backends
+        ):
+            self.local_dirs.append(os.getcwd())
+    
+    def _get_plugin_dirs(self) -> List[Path]:
+        """
+        Get all framework plugin directories (built-in and installed).
+        
+        Returns:
+            List of plugin directory paths
+        """
+        plugin_dirs = []
+        
+        # Get built-in plugins from the canonical package layout.
+        from ..core.plugin_manager import PluginManager
+
+        try:
+            plugin_manager = PluginManager()
+            runtime_plugin_roots = plugin_manager.get_runtime_plugin_roots()
+            for plugin_dir in runtime_plugin_roots:
+                if plugin_dir not in plugin_dirs:
+                    plugin_dirs.append(plugin_dir)
+        except Exception as e:
+            # Fail silently if plugin manager is not available
+            pass
+        
+        from aworld.plugins.discovery import discover_plugins
+
+        discovered = discover_plugins(plugin_dirs)
+        resolved = []
+        seen = set()
+        active_framework_plugins = 0
+        for plugin in discovered:
+            plugin_root = Path(plugin.manifest.plugin_root)
+            if plugin_root not in seen:
+                resolved.append(plugin_root)
+                seen.add(plugin_root)
+            if getattr(plugin, "source", None) == "manifest":
+                active_framework_plugins += 1
+
+        if active_framework_plugins and hasattr(self, 'cli') and hasattr(self.cli, 'console'):
+            self.cli.console.print(f"📦 Found {active_framework_plugins} active plugin(s)")
+
+        return resolved
+
+    def _get_builtin_agent_dirs(self) -> List[Path]:
+        """Get built-in agent bundle directories such as smllc."""
+        from ..core.plugin_manager import get_builtin_agent_bundle_roots
+
+        bundle_dirs: List[Path] = []
+        seen = set()
+        for bundle_dir in get_builtin_agent_bundle_roots():
+            resolved = Path(bundle_dir).resolve()
+            if resolved in seen:
+                continue
+            bundle_dirs.append(resolved)
+            seen.add(resolved)
+        return bundle_dirs
+    
+    async def _load_skills(self) -> Dict[str, int]:
+        """
+        Load skills from all plugin directories.
+        
+        Searches for skills in plugin_dir/skills directory for each plugin.
+        Only directories containing SKILL.md file are considered as skills.
+        Skills are registered into the global skill registry.
+        
+        Returns:
+            Dictionary mapping plugin names to number of skills loaded
+        """
+        from ..core.plugin_manager import PluginManager
+        
+        plugin_manager = PluginManager()
+        console = self.cli.console if hasattr(self, 'cli') and hasattr(self.cli, 'console') and self.cli.console else None
+        
+        return await plugin_manager._load_skills(
+            self.plugin_dirs + self.builtin_agent_dirs,
+            console=console,
+        )
+    
+    async def _load_agents(self) -> List[AgentInfo]:
+        """
+        Load agents following unified lifecycle (Load phase):
+        1. Load plugins (skills + agents)
+        2. Load local agents
+        3. Load remote agents
+        
+        Uses abstract loaders to eliminate code duplication.
+        Loaders are responsible ONLY for loading, not for creating executors.
+        
+        Returns:
+            List of all loaded AgentInfo objects (deduplicated, prioritizing local over remote)
+        """
+        from ..core.plugin_manager import PluginManager
+        
+        plugin_manager = PluginManager()
+        console = self.cli.console if hasattr(self, 'cli') and hasattr(self.cli, 'console') and self.cli.console else None
+        
+        # Load agents using plugin_manager
+        all_agents, agent_sources_map = await plugin_manager._load_agents(
+            self.plugin_dirs,
+            builtin_agent_dirs=self.builtin_agent_dirs,
+            local_dirs=self.local_dirs,
+            remote_backends=self.remote_backends,
+            console=console
+        )
+        self._agent_load_failures = list(plugin_manager.agent_load_failures)
+        
+        # Update _agent_sources based on final agents
+        self._agent_sources.clear()
+        for agent in all_agents:
+            if agent.name in agent_sources_map:
+                self._agent_sources[agent.name] = agent_sources_map[agent.name]
+        
+        return all_agents
+    
+    async def _create_executor(self, agent: AgentInfo) -> Optional[AgentExecutor]:
+        """
+        Create executor based on agent source type (Run phase).
+        
+        Load and Run are separated:
+        - Load phase: Loaders load agents
+        - Run phase: Runtime creates executors based on source type
+        
+        This method handles executor creation for all source types:
+        - plugin/local: Creates LocalAgentExecutor
+        - remote: Creates RemoteAgentExecutor
+        
+        Args:
+            agent: AgentInfo object
+            
+        Returns:
+            AgentExecutor instance or None if creation failed
+        """
+        source_info = self._agent_sources.get(agent.name)
+        if not source_info:
+            self.cli.console.print(f"[red]❌ Source information not found for agent '{agent.name}'[/red]")
+            return None
+        
+        source_type = source_info.get("type")
+        
+        # Create executor based on source type
+        if source_type in ["plugin", "builtin", "local"]:
+            return await self._create_local_executor(agent, source_info)
+        elif source_type == "remote":
+            return self._create_remote_executor(agent, source_info)
+        else:
+            self.cli.console.print(f"[red]❌ Unknown source type '{source_type}' for agent '{agent.name}'[/red]")
+            return None
+    
+    async def _create_local_executor(
+        self, 
+        agent: AgentInfo, 
+        source_info: Dict
+    ) -> Optional[AgentExecutor]:
+        """
+        Create executor for local/plugin agent.
+        
+        Args:
+            agent: AgentInfo object
+            source_info: Source information dictionary
+            
+        Returns:
+            LocalAgentExecutor instance or None if creation failed
+        """
+        try:
+            # Get the agent from registry
+            local_agent = LocalAgentRegistry.get_agent(agent.name)
+            if not local_agent:
+                self.cli.console.print(f"[red]❌ Agent '{agent.name}' not found in registry.[/red]")
+                return None
+            
+            # Get context config from agent if available
+            context_config = (
+                local_agent.context_config 
+                if hasattr(local_agent, 'context_config') 
+                else AmniConfigFactory.create(AmniConfigLevel.NAVIGATOR, debug_mode=True)
+            )
+            context_config.agent_config.history_scope = "session"
+            
+            # Get hooks from agent if available (support both LocalAgent and AgentTeam)
+            hooks = None
+            if hasattr(local_agent, 'hooks') and local_agent.hooks:
+                hooks = local_agent.hooks
+            # Also check if source is AgentTeam (from aworld-app-infra)
+            elif hasattr(agent, 'source') and agent.source:
+                source = agent.source
+                if hasattr(source, 'hooks') and source.hooks:
+                    hooks = source.hooks
+            
+            # Try to get swarm without context first (for swarm instances or functions that don't need context)
+            try:
+                swarm = await local_agent.get_swarm(None)
+            except (TypeError, AttributeError):
+                # If swarm function requires context, create a temporary context
+                # Create a temporary TaskInput for swarm initialization
+                temp_task_input = TaskInput(
+                    user_id="cli_user",
+                    session_id=f"temp_session_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    task_id=f"temp_task_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    task_content="",
+                    origin_user_input=""
+                )
+                # Create temporary context
+                temp_context = await ApplicationContext.from_input(
+                    temp_task_input,
+                    context_config=context_config
+                )
+                # Get swarm with context
+                swarm = await local_agent.get_swarm(temp_context)
+
+            _apply_self_evolve_config_to_swarm(swarm, self._self_evolve_config)
+            _apply_runtime_skill_paths_to_swarm(
+                swarm,
+                self.runtime_skill_paths,
+                self.isolated_candidate_skill_paths,
+            )
+            
+            executor = LocalAgentExecutor(
+                swarm, 
+                context_config=context_config, 
+                console=self.cli.console,
+                session_id=self._session_id,
+                hooks=hooks,
+                runtime_skill_paths=list(self.runtime_skill_paths),
+                isolated_candidate_skill_paths=list(
+                    self.isolated_candidate_skill_paths
+                ),
+            )
+            self._annotate_executor_source(executor, source_info)
+            return executor
+            
+        except Exception as e:
+            self.cli.console.print(f"[red]❌ Failed to initialize local agent session: {e}[/red]")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _create_remote_executor(
+        self, 
+        agent: AgentInfo, 
+        source_info: Dict
+    ) -> AgentExecutor:
+        """
+        Create executor for remote agent.
+        
+        Args:
+            agent: AgentInfo object
+            source_info: Source information dictionary
+            
+        Returns:
+            RemoteAgentExecutor instance
+        """
+        backend_url = source_info["location"]
+        executor = RemoteAgentExecutor(
+            backend_url,
+            agent.name,
+            console=self.cli.console,
+            session_id=self._session_id,
+            disable_live_display=self._disable_live_display,
+        )
+        self._annotate_executor_source(executor, source_info)
+        return executor
+
+    def _annotate_executor_source(self, executor: AgentExecutor, source_info: Dict) -> None:
+        executor._session_source_type = source_info.get("type")
+        executor._session_source_location = source_info.get("location")
+
+    def _restore_executor_session(self, executor: AgentExecutor, current_agent_name: str | None = None) -> None:
+        if self._resume_record is None or self._session_store is None:
+            session_id = getattr(executor, "session_id", None)
+            if not session_id:
+                return
+            try:
+                CliSessionStore().ensure_session(
+                    session_id=session_id,
+                    cwd=os.getcwd(),
+                    agent_name=current_agent_name or self.agent_name or "Aworld",
+                    mode=getattr(executor, "_session_mode", "interactive"),
+                    source_type=getattr(executor, "_session_source_type", None),
+                    source_location=getattr(executor, "_session_source_location", None),
+                )
+            except Exception:
+                pass
+            return
+        result = restore_session_to_executor(
+            record=self._resume_record,
+            executor_instance=executor,
+            session_store=self._session_store,
+            current_agent_name=current_agent_name,
+            current_cwd=self._resume_cwd,
+            require_same_agent=self._require_same_resume_agent,
+        )
+        if result.warning and hasattr(self, "cli") and getattr(self.cli, "console", None):
+            self.cli.console.print(f"[yellow]{result.warning}[/yellow]")
+    
+    def _get_source_type(self) -> str:
+        """Get source type for display."""
+        types = []
+        if self.plugin_dirs:
+            types.append("PLUGIN")
+        if self.builtin_agent_dirs:
+            types.append("BUILTIN")
+        if self.local_dirs:
+            types.append("LOCAL")
+        if self.remote_backends:
+            types.append("REMOTE")
+        return "+".join(types) if types else "CLI"
+    
+    def _get_source_location(self) -> str:
+        """Get source location for display."""
+        locations = []
+        if self.plugin_dirs:
+            locations.extend([str(d) for d in self.plugin_dirs])
+        if self.builtin_agent_dirs:
+            locations.extend([str(d) for d in self.builtin_agent_dirs])
+        if self.local_dirs:
+            locations.extend(self.local_dirs)
+        if self.remote_backends:
+            locations.extend(self.remote_backends)
+        return "; ".join(locations) if locations else ""
+
+__all__ = ["CliRuntime"]

@@ -1,0 +1,380 @@
+# coding: utf-8
+# Copyright (c) 2025 inclusionAI.
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from aworld.config import ConfigDict
+from aworld.core.common import ActionModel, Observation, TaskItem
+from aworld.core.context.base import Context
+from aworld.core.context.session import Session
+from aworld.core.context.compiler import (
+    ContextObservationSidecar,
+    adapt_final_messages,
+)
+from aworld.core.event.base import Constants, Message, TopicType
+from aworld.core.task import Task, TaskResponse
+from aworld.core.tool.base import AsyncTool, _enforce_runtime_tool_call_budget
+from aworld.runners.handler.tool import DefaultToolHandler
+from aworld.runners.handler.task import DefaultTaskHandler
+from aworld.runners.task_runner import TaskRunner
+from aworld.runners.event_runner import TaskEventRunner
+
+
+class SyncResetAsyncTool(AsyncTool):
+    """AsyncTool variant with a synchronous reset to cover mixed implementations."""
+
+    def __init__(self, conf=None, **kwargs):
+        self.reset_calls = 0
+        super().__init__(conf=conf or ConfigDict({}), **kwargs)
+
+    def reset(self, *, seed: int | None = None, options=None):
+        self.reset_calls += 1
+        return Observation(content="tool-ready"), {}
+
+    async def do_step(self, action, **kwargs):
+        return Observation(content="done"), 1.0, False, False, {}
+
+    async def close(self):
+        return None
+
+
+class DummyTaskRunner(TaskRunner):
+    async def do_run(self, context=None) -> TaskResponse:
+        return TaskResponse(success=True, answer="ok")
+
+    async def streaming(self):
+        if False:
+            yield None
+
+
+@pytest.mark.asyncio
+async def test_task_runner_post_run_releases_runtime_tool_call_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AWORLD_TOOL_CALL_LIMIT", "1")
+
+    async def no_hooks(**kwargs):
+        if False:
+            yield kwargs
+
+    monkeypatch.setattr("aworld.runners.task_runner.run_hooks", no_hooks)
+    task = Task(id="task-budget-cleanup", input="test", context=Context())
+    runner = DummyTaskRunner(task, agent_oriented=False)
+    runner.context = Context(
+        task_id=task.id,
+        session=Session(session_id="session-budget"),
+    )
+    first_message = Message(
+        category=Constants.TOOL,
+        payload=[],
+        session_id="session-budget",
+        headers={"context": runner.context},
+    )
+    action = [
+        ActionModel(
+            tool_name="tool",
+            action_name="run",
+            tool_call_id="call-1",
+        )
+    ]
+
+    _enforce_runtime_tool_call_budget("tool", action, first_message)
+    await runner.post_run()
+
+    replacement_context = Context(
+        task_id=task.id,
+        session=Session(session_id="session-budget"),
+    )
+    replacement_message = Message(
+        category=Constants.TOOL,
+        payload=[],
+        session_id="session-budget",
+        headers={"context": replacement_context},
+    )
+    _enforce_runtime_tool_call_budget("tool", action, replacement_message)
+
+
+class CoroutineOnlyInnerHandler:
+    def __init__(self):
+        self.messages = []
+
+    async def handle(self, message):
+        self.messages.append(message)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_default_tool_handler_accepts_sync_reset_for_async_tool():
+    runner = MagicMock()
+    runner.tools = {}
+    runner.tools_conf = {}
+    runner.event_mng.get_handlers.return_value = {}
+
+    handler = DefaultToolHandler(runner)
+    tool = SyncResetAsyncTool(name="async_broken_tool")
+
+    message = Message(
+        category=Constants.TOOL,
+        payload=[
+            ActionModel(
+                tool_name="async_broken_tool",
+                tool_call_id="call-1",
+                agent_name="root-agent",
+            )
+        ],
+        session_id="session-1",
+        headers={"context": Context()},
+    )
+
+    with patch("aworld.runners.handler.tool.ToolFactory", return_value=tool):
+        outputs = [msg async for msg in handler._do_handle(message)]
+
+    assert tool.reset_calls == 1
+    assert runner.tools["async_broken_tool"] is tool
+    assert tool.context is message.context
+    assert any(msg.topic == TopicType.SUBSCRIBE_TOOL for msg in outputs)
+    assert any(msg.category == Constants.TOOL and msg.receiver == "async_broken_tool" for msg in outputs)
+
+
+@pytest.mark.asyncio
+async def test_default_tool_handler_prioritizes_dynamic_subscription_before_tool_execution():
+    runner = MagicMock()
+    runner.tools = {}
+    runner.tools_conf = {}
+    runner.event_mng.get_handlers.return_value = {}
+
+    handler = DefaultToolHandler(runner)
+    tool = SyncResetAsyncTool(name="async_broken_tool")
+
+    message = Message(
+        category=Constants.TOOL,
+        payload=[
+            ActionModel(
+                tool_name="async_broken_tool",
+                tool_call_id="call-1",
+                agent_name="root-agent",
+            )
+        ],
+        session_id="session-1",
+        headers={"context": Context()},
+    )
+
+    with patch("aworld.runners.handler.tool.ToolFactory", return_value=tool):
+        outputs = [msg async for msg in handler._do_handle(message)]
+
+    subscribe_message = next(msg for msg in outputs if msg.topic == TopicType.SUBSCRIBE_TOOL)
+    tool_message = next(msg for msg in outputs if msg.category == Constants.TOOL and msg.receiver == "async_broken_tool")
+
+    assert subscribe_message.priority < tool_message.priority
+
+
+@pytest.mark.asyncio
+async def test_task_event_runner_wires_tool_callback_handler():
+    task = Task(
+        id="task-tool-callback",
+        name="task-tool-callback",
+        input="hello",
+        observation=Observation(content=[]),
+        context=Context(),
+        conf=ConfigDict(),
+    )
+
+    runner = TaskEventRunner(task, agent_oriented=False)
+    await runner.pre_run()
+
+    assert any(handler.__class__.__name__ == "ToolCallbackHandler" for handler in runner.handlers)
+
+
+@pytest.mark.asyncio
+async def test_task_event_runner_inner_handlers_accept_coroutine_only_handlers():
+    task = Task(
+        id="task-inner-handler",
+        name="task-inner-handler",
+        input="hello",
+        observation=Observation(content=[]),
+        context=Context(),
+        conf=ConfigDict(),
+    )
+
+    runner = TaskEventRunner(task, agent_oriented=False)
+    await runner.pre_run()
+
+    handler = CoroutineOnlyInnerHandler()
+    message = Message(
+        category=Constants.OUTPUT,
+        payload=SimpleNamespace(output_type=lambda: "default"),
+        session_id="session-1",
+        headers={"context": runner.context},
+    )
+
+    outputs = [event async for event in runner._inner_handler_process([message], [handler])]
+
+    assert outputs == []
+    assert handler.messages == [message]
+
+
+@pytest.mark.asyncio
+async def test_default_task_handler_sanitizes_internal_tool_mismatch_errors():
+    runner = MagicMock()
+    runner.task = SimpleNamespace(max_retry_count=0, hooks=None, is_sub_task=False, id="task-1")
+    runner.context = Context()
+    runner.start_time = 0.0
+    runner.stop = AsyncMock()
+    runner.should_stop_task = AsyncMock(return_value=False)
+
+    handler = DefaultTaskHandler(runner)
+    context = Context()
+    context.set_task(SimpleNamespace(timeout=0))
+    message = Message(
+        category=Constants.TASK,
+        payload=TaskItem(
+            msg="AWorldRuntimeException: tool_calls mismatch! CONTEXT_TOOL__list_sessions:0 not found in [], messages: [{'role': 'system', 'content': 'secret'}]",
+            data=None,
+            stop=True,
+        ),
+        session_id="session-1",
+        topic=TopicType.ERROR,
+        headers={"context": context},
+    )
+
+    outputs = [msg async for msg in handler.handle(message)]
+
+    response = outputs[-1].payload
+    assert "tool_calls mismatch" not in response.answer
+    assert "messages:" not in response.answer
+    assert "internal" in response.answer.lower()
+    assert response.failure_origin == "infrastructure"
+    assert response.failure_code == "runtime_exception"
+
+
+@pytest.mark.asyncio
+async def test_default_task_handler_preserves_typed_failure_evidence():
+    runner = MagicMock()
+    runner.task = SimpleNamespace(max_retry_count=0, hooks=None, is_sub_task=False, id="task-1")
+    runner.context = Context()
+    runner.start_time = 0.0
+    runner.stop = AsyncMock()
+    runner.should_stop_task = AsyncMock(return_value=False)
+
+    handler = DefaultTaskHandler(runner)
+    context = Context()
+    context.set_task(SimpleNamespace(timeout=0))
+    message = Message(
+        category=Constants.TASK,
+        payload=TaskItem(msg="provider details", data=None, stop=True),
+        session_id="session-1",
+        topic=TopicType.ERROR,
+        headers={
+            "context": context,
+            "task_failure": {
+                "origin": "infrastructure",
+                "code": "provider_timeout",
+                "error_type": "GenerationBudgetExceeded",
+            },
+        },
+    )
+
+    outputs = [msg async for msg in handler.handle(message)]
+
+    response = outputs[-1].payload
+    assert response.failure_origin == "infrastructure"
+    assert response.failure_code == "provider_timeout"
+    assert response.error_type == "GenerationBudgetExceeded"
+
+
+@pytest.mark.asyncio
+async def test_task_owned_failure_preserves_latest_model_answer():
+    runner = MagicMock()
+    runner.task = SimpleNamespace(max_retry_count=0, hooks=None, is_sub_task=False, id="task-1")
+    runner.context = Context()
+    runner.context.get_reconciled_llm_calls = lambda: [
+        {"response": {"message": {"content": "best available model answer"}}}
+    ]
+    runner.start_time = 0.0
+    runner.stop = AsyncMock()
+    runner.should_stop_task = AsyncMock(return_value=False)
+    context = Context()
+    context.set_task(SimpleNamespace(timeout=0))
+    context.get_reconciled_llm_calls = runner.context.get_reconciled_llm_calls
+    message = Message(
+        category=Constants.TASK,
+        payload=TaskItem(msg="runtime failed", data=None, stop=True),
+        session_id="session-1",
+        topic=TopicType.ERROR,
+        headers={
+            "context": context,
+            "task_failure": {
+                "origin": "task",
+                "code": "runtime_exception",
+                "error_type": "RuntimeError",
+            },
+        },
+    )
+
+    outputs = [msg async for msg in DefaultTaskHandler(runner).handle(message)]
+
+    response = outputs[-1].payload
+    assert response.answer == "best available model answer"
+    assert response.status == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_task_runner_accepts_sync_reset_for_async_tool():
+    tool = SyncResetAsyncTool(name="async_broken_tool")
+    swarm = MagicMock()
+    swarm.agents = {}
+    swarm.reset = MagicMock()
+
+    task = Task(
+        input="hello",
+        swarm=swarm,
+        tools=[tool],
+        tool_names=[],
+        context=Context(),
+        conf=ConfigDict(),
+    )
+
+    runner = DummyTaskRunner(task)
+    await runner.pre_run()
+
+    assert tool.reset_calls == 1
+    assert tool.context is runner.context
+    assert runner.observation.content == "tool-ready"
+
+
+@pytest.mark.asyncio
+async def test_root_task_context_reuse_fences_prior_request_observations():
+    context = Context(task_id="old-root-task")
+    context.publish_context_observation(
+        ContextObservationSidecar.from_adapter_result(
+            owner="test.owner",
+            namespace="agent-1",
+            source_identity="owner://old-root-task",
+            result=adapt_final_messages(
+                [{"role": "system", "content": "old private output"}],
+                source_identity="owner://old-root-task",
+            ),
+        )
+    )
+    swarm = MagicMock()
+    swarm.agents = {}
+    swarm.reset = MagicMock()
+    task = Task(
+        id="new-root-task",
+        input="hello",
+        swarm=swarm,
+        tools=[],
+        tool_names=[],
+        context=context.deep_copy(),
+        conf=ConfigDict(),
+    )
+
+    runner = DummyTaskRunner(task)
+    await runner.pre_run()
+
+    assert runner.context.task_id == "new-root-task"
+    assert runner.context.get_context_observations() == ()
+    assert context.get_context_observations()

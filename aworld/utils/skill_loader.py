@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""
+Export structured metadata for all skill documentation files.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
+
+import yaml
+from aworld.logs.util import logger
+
+# Default cache directory for GitHub repositories
+DEFAULT_CACHE_DIR = Path.home() / ".aworld" / "skills"
+
+
+def parse_github_url(github_url: str) -> Optional[Dict[str, str]]:
+    """
+    Parse GitHub URL to extract owner, repo, branch, and subdirectory.
+    
+    Supports multiple formats:
+    - https://github.com/owner/repo
+    - https://github.com/owner/repo/tree/branch
+    - https://github.com/owner/repo/tree/branch/subdirectory
+    - git@github.com:owner/repo.git
+    
+    Args:
+        github_url: GitHub repository URL
+        
+    Returns:
+        Dict with 'owner', 'repo', 'branch' (default: 'main'), and 'subdirectory' (optional) keys,
+        or None if URL is invalid
+        
+    Example:
+        >>> parse_github_url("https://github.com/muratcankoylan/Agent-Skills-for-Context-Engineering")
+        {'owner': 'muratcankoylan', 'repo': 'Agent-Skills-for-Context-Engineering', 'branch': 'main', 'subdirectory': None}
+        >>> parse_github_url("https://github.com/user/repo/tree/main/skills")
+        {'owner': 'user', 'repo': 'repo', 'branch': 'main', 'subdirectory': 'skills'}
+    """
+    # Handle SSH format: git@github.com:owner/repo.git
+    ssh_pattern = r'git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+)(?:\.git)?$'
+    ssh_match = re.match(ssh_pattern, github_url)
+    if ssh_match:
+        return {
+            'owner': ssh_match.group('owner'),
+            'repo': ssh_match.group('repo'),
+            'branch': 'main',
+            'subdirectory': None
+        }
+    
+    # Handle HTTPS format
+    parsed = urlparse(github_url)
+    if parsed.netloc not in ['github.com', 'www.github.com']:
+        return None
+    
+    path_parts = parsed.path.strip('/').split('/')
+    if len(path_parts) < 2:
+        return None
+    
+    owner = path_parts[0]
+    repo = path_parts[1]
+    branch = 'main'
+    subdirectory = None
+    
+    # Check if there's a tree path (e.g., /tree/branch or /tree/branch/subdirectory)
+    if len(path_parts) >= 4 and path_parts[2] == 'tree':
+        branch = path_parts[3]
+        if len(path_parts) > 4:
+            subdirectory = '/'.join(path_parts[4:])
+    
+    return {
+        'owner': owner,
+        'repo': repo,
+        'branch': branch,
+        'subdirectory': subdirectory
+    }
+
+
+def get_github_cache_path(repo_info: Dict[str, str], cache_dir: Optional[Path] = None) -> Path:
+    """
+    Get the cache path for a GitHub repository.
+    
+    Args:
+        repo_info: Dictionary with 'owner', 'repo', 'branch' keys from parse_github_url
+        cache_dir: Optional cache directory, defaults to DEFAULT_CACHE_DIR
+        
+    Returns:
+        Path to the cached repository directory
+        
+    Example:
+        >>> repo_info = {'owner': 'user', 'repo': 'repo', 'branch': 'main'}
+        >>> get_github_cache_path(repo_info)
+        Path('~/.aworld/skills/user/repo/main')
+    """
+    if cache_dir is None:
+        cache_dir = DEFAULT_CACHE_DIR
+    
+    # Create cache path: cache_dir/owner/repo/branch
+    cache_path = cache_dir / repo_info['owner'] / repo_info['repo'] / repo_info['branch']
+    return cache_path
+
+
+def clone_or_update_github_repo(
+    repo_info: Dict[str, str],
+    cache_dir: Optional[Path] = None,
+    force_update: bool = False
+) -> Path:
+    """
+    Clone or update a GitHub repository to the cache directory.
+    
+    If the repository already exists in cache, it will be updated using git pull.
+    If force_update is True, the cache will be removed and re-cloned.
+    
+    Args:
+        repo_info: Dictionary with 'owner', 'repo', 'branch' keys from parse_github_url
+        cache_dir: Optional cache directory, defaults to DEFAULT_CACHE_DIR
+        force_update: If True, remove existing cache and re-clone
+        
+    Returns:
+        Path to the cloned repository directory
+        
+    Raises:
+        RuntimeError: If git is not available or clone/update fails
+        
+    Example:
+        >>> repo_info = {'owner': 'muratcankoylan', 'repo': 'Agent-Skills-for-Context-Engineering', 'branch': 'main'}
+        >>> clone_or_update_github_repo(repo_info)
+        Path('~/.aworld/skills/muratcankoylan/Agent-Skills-for-Context-Engineering/main')
+    """
+    cache_path = get_github_cache_path(repo_info, cache_dir)
+    repo_url = f"https://github.com/{repo_info['owner']}/{repo_info['repo']}.git"
+    branch = repo_info['branch']
+    
+    # Check if git is available
+    try:
+        subprocess.run(['git', '--version'], check=True, capture_output=True, timeout=5)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        raise RuntimeError("❌ Git is not available. Please install git to use GitHub skill repositories.")
+    
+    # Create cache directory structure
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # If force_update, remove existing cache
+    if force_update and cache_path.exists():
+        logger.info(f"🔄 Force updating repository cache: {cache_path}")
+        shutil.rmtree(cache_path)
+    
+    # Clone or update repository
+    if cache_path.exists():
+        # Update existing repository
+        try:
+            logger.info(f"🔄 Updating cached repository: {repo_url} (branch: {branch})")
+            # Fetch and checkout the specified branch
+            subprocess.run(
+                ['git', 'fetch', 'origin'],
+                cwd=cache_path,
+                check=True,
+                capture_output=True,
+                timeout=60
+            )
+            subprocess.run(
+                ['git', 'checkout', branch],
+                cwd=cache_path,
+                check=True,
+                capture_output=True,
+                timeout=10
+            )
+            subprocess.run(
+                ['git', 'pull', 'origin', branch],
+                cwd=cache_path,
+                check=True,
+                capture_output=True,
+                timeout=60
+            )
+            logger.info(f"✅ Repository updated successfully: {cache_path}")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"⚠️ Failed to update repository, will re-clone: {e}")
+            shutil.rmtree(cache_path)
+            # Fall through to clone
+        except subprocess.TimeoutExpired:
+            logger.warning(f"⚠️ Git operation timed out, will re-clone")
+            shutil.rmtree(cache_path)
+            # Fall through to clone
+    
+    if not cache_path.exists():
+        # Clone repository
+        try:
+            logger.info(f"📥 Cloning repository: {repo_url} (branch: {branch}) to {cache_path}")
+            subprocess.run(
+                ['git', 'clone', '--depth', '1', '--branch', branch, repo_url, str(cache_path)],
+                check=True,
+                capture_output=True,
+                timeout=120
+            )
+            logger.info(f"✅ Repository cloned successfully: {cache_path}")
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
+            logger.error(f"❌ Failed to clone repository {repo_url}: {error_msg}")
+            raise RuntimeError(f"Failed to clone GitHub repository {repo_url}: {error_msg}")
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ Git clone timed out for {repo_url}")
+            raise RuntimeError(f"Git clone timed out for GitHub repository {repo_url}")
+    
+    return cache_path
+
+
+def resolve_skill_path(skill_path: Union[str, Path], cache_dir: Optional[Path] = None) -> Path:
+    """
+    Resolve skill path, handling both local paths and GitHub URLs.
+    
+    If the path is a GitHub URL, it will be cloned/cached locally.
+    If it's a local path, it will be resolved as-is.
+    
+    Args:
+        skill_path: Local path or GitHub URL
+        cache_dir: Optional cache directory for GitHub repos, defaults to DEFAULT_CACHE_DIR
+        
+    Returns:
+        Resolved Path object pointing to the skill directory
+        
+    Example:
+        >>> resolve_skill_path("https://github.com/muratcankoylan/Agent-Skills-for-Context-Engineering")
+        Path('~/.aworld/skills/muratcankoylan/Agent-Skills-for-Context-Engineering/main')
+        >>> resolve_skill_path("./local/skills")
+        Path('/absolute/path/to/local/skills')
+    """
+    skill_path_str = str(skill_path)
+    
+    # Check if it's a GitHub URL
+    if 'github.com' in skill_path_str or skill_path_str.startswith('git@github.com'):
+        repo_info = parse_github_url(skill_path_str)
+        if not repo_info:
+            raise ValueError(f"❌ Invalid GitHub URL format: {skill_path_str}")
+        
+        # Clone or update repository
+        cache_path = clone_or_update_github_repo(repo_info, cache_dir)
+        
+        # If there's a subdirectory, append it to the cache path
+        if repo_info.get('subdirectory'):
+            cache_path = cache_path / repo_info['subdirectory']
+            if not cache_path.exists():
+                logger.warning(f"⚠️ Subdirectory not found in repository: {cache_path}")
+        
+        return cache_path
+    else:
+        # Local path - expand ~ if present
+        skill_path_str = str(skill_path)
+        if '~' in skill_path_str:
+            skill_path_str = os.path.expanduser(skill_path_str)
+        return Path(skill_path_str).resolve()
+
+
+def _parse_string_list(raw: Any) -> List[str]:
+    """Normalize input to list of non-empty strings."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str):
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return []
+
+
+def _resolve_metadata_block(raw: Any) -> Optional[Dict[str, Any]]:
+    """
+    Resolve the 'aworld' block from frontmatter metadata (JSON or dict).
+    Expects either a JSON string (with optional 'metadata' wrapper) or a dict with 'aworld' key.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        obj = raw
+    else:
+        try:
+            s = raw.strip() if isinstance(raw, str) else str(raw)
+            obj = json.loads(s)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(obj, dict):
+        return None
+    # Support both top-level "aworld" and nested under "metadata"
+    aworld = obj.get("aworld") or (obj.get("metadata") or {}).get("aworld")
+    if aworld and isinstance(aworld, dict):
+        return aworld
+    return None
+
+
+def resolve_aworld_metadata(front_matter: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Extract and normalize metadata.aworld from skill frontmatter.
+    Returns dict with: always (bool), requires (bins, anyBins, env, config), install (list of install specs).
+    """
+    raw = front_matter.get("metadata")
+    block = _resolve_metadata_block(raw)
+    if not block:
+        return None
+    requires_raw = block.get("requires")
+    if isinstance(requires_raw, dict):
+        requires = {
+            "bins": _parse_string_list(requires_raw.get("bins")),
+            "anyBins": _parse_string_list(requires_raw.get("anyBins")),
+            "env": _parse_string_list(requires_raw.get("env")),
+            "config": _parse_string_list(requires_raw.get("config")),
+        }
+    else:
+        requires = {"bins": [], "anyBins": [], "env": [], "config": []}
+    install_raw = block.get("install")
+    install_specs: List[Dict[str, Any]] = []
+    if isinstance(install_raw, list):
+        for item in install_raw:
+            if isinstance(item, dict) and item.get("kind"):
+                install_specs.append({
+                    "id": item.get("id"),
+                    "kind": str(item.get("kind")).strip().lower(),
+                    "label": item.get("label"),
+                    "bins": _parse_string_list(item.get("bins")),
+                    "formula": item.get("formula"),
+                    "package": item.get("package"),
+                    "module": item.get("module"),
+                    "url": item.get("url"),
+                    "os": _parse_string_list(item.get("os")),
+                })
+    return {
+        "always": bool(block.get("always")),
+        "requires": requires,
+        "install": install_specs,
+    }
+
+
+def _has_bin(bin_name: str) -> bool:
+    return shutil.which(bin_name) is not None
+
+
+def evaluate_skill_requirements(aworld_meta: Dict[str, Any]) -> Tuple[bool, Dict[str, List[str]]]:
+    """
+    Evaluate requires against current environment. Returns (eligible, missing).
+    If always is True, returns (True, {}). Otherwise checks bins, anyBins, env.
+    """
+    if aworld_meta.get("always"):
+        return True, {}
+    requires = aworld_meta.get("requires") or {}
+    missing: Dict[str, List[str]] = {"bins": [], "anyBins": [], "env": [], "config": []}
+    # bins: all required
+    for b in requires.get("bins") or []:
+        if not _has_bin(b):
+            missing["bins"].append(b)
+    # anyBins: at least one required
+    any_bins = requires.get("anyBins") or []
+    if any_bins and not any(_has_bin(b) for b in any_bins):
+        missing["anyBins"] = list(any_bins)
+    # env: all required
+    for e in requires.get("env") or []:
+        if not os.environ.get(e):
+            missing["env"].append(e)
+    # config: optional path existence (simplified: we don't have config paths in aworld yet)
+    for c in requires.get("config") or []:
+        if not os.path.exists(os.path.expanduser(c)):
+            missing["config"].append(c)
+    eligible = (
+        len(missing["bins"]) == 0
+        and len(missing["anyBins"]) == 0
+        and len(missing["env"]) == 0
+        and len(missing["config"]) == 0
+    )
+    return eligible, missing
+
+
+def _extract_front_matter_legacy(content_lines: List[str]) -> Tuple[Dict[str, Any], int]:
+    front_matter: Dict[str, Any] = {}
+    if not content_lines or content_lines[0].strip() != "---":
+        return front_matter, 0
+
+    end_index = 1
+    while end_index < len(content_lines) and content_lines[end_index].strip() != "---":
+        line = content_lines[end_index]
+        line_stripped = line.strip()
+        if ":" in line_stripped:
+            key, value = line_stripped.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            # "metadata" key: multi-line JSON or inline JSON
+            if key == "metadata":
+                if not value or value == "{":
+                    chunk = [value] if value else []
+                    i = end_index + 1
+                    while i < len(content_lines) and content_lines[i].strip() != "---":
+                        next_line = content_lines[i]
+                        if next_line and (next_line.startswith(" ") or next_line.startswith("\t")):
+                            chunk.append(next_line)
+                            i += 1
+                        else:
+                            break
+                    value = "\n".join(chunk).strip()
+                    end_index = i
+                else:
+                    end_index += 1
+                if value:
+                    try:
+                        front_matter[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        front_matter[key] = value
+            else:
+                end_index += 1
+                # Try to parse JSON values (for tool_list and other structured data)
+                if key == "tool_list" and value:
+                    try:
+                        front_matter[key] = json.loads(value)
+                        logger.debug(f"✅ Successfully parsed tool_list as JSON: {front_matter[key]}")
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"⚠️ Failed to parse tool_list as JSON: {e}, keeping as string")
+                        front_matter[key] = value
+                else:
+                    front_matter[key] = value
+            continue
+        end_index += 1
+
+    if end_index >= len(content_lines):
+        return front_matter, len(content_lines)
+
+    return front_matter, end_index + 1
+
+
+def extract_front_matter(content_lines: List[str]) -> Tuple[Dict[str, Any], int]:
+    """
+    Extract YAML front matter from the provided content lines.
+
+    Args:
+        content_lines (List[str]): The content of the markdown file split into lines.
+
+    Returns:
+        Tuple[Dict[str, Any], int]: A dictionary containing the parsed front matter key-value pairs
+        and the index where the front matter ends.
+
+    Example:
+        >>> extract_front_matter(["---", "name: sample", "---", "body"])
+        ({'name': 'sample'}, 3)
+        >>> extract_front_matter(["---", "name: sample", 'tool_list: {"ms-playwright": []}', "---", "body"])
+        ({'name': 'sample', 'tool_list': {'ms-playwright': []}}, 4)
+    """
+    if not content_lines or content_lines[0].strip() != "---":
+        return {}, 0
+
+    end_index = 1
+    while end_index < len(content_lines) and content_lines[end_index].strip() != "---":
+        end_index += 1
+
+    if end_index >= len(content_lines):
+        return _extract_front_matter_legacy(content_lines)
+
+    front_matter_block = "\n".join(content_lines[1:end_index])
+    try:
+        parsed = yaml.safe_load(front_matter_block) or {}
+    except yaml.YAMLError as exc:
+        logger.warning(f"⚠️ Failed to parse front matter as YAML: {exc}, falling back to legacy parser")
+        return _extract_front_matter_legacy(content_lines)
+
+    if not isinstance(parsed, dict):
+        return {}, end_index + 1
+
+    return parsed, end_index + 1
+
+
+def collect_skill_docs(
+    root_path: Union[str, Path],
+    cache_dir: Optional[Path] = None
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Collect skill documentation metadata from all subdirectories containing skill.md or SKILL.md files.
+    
+    Supports both local paths and GitHub URLs. If a GitHub URL is provided, it will be cloned/cached
+    locally before collecting skills.
+
+    Args:
+        root_path (Union[str, Path]): Root directory or GitHub URL to search for skill documentation files.
+            Examples:
+            - Local path: "./skills" or "/path/to/skills"
+            - GitHub URL: "https://github.com/owner/repo" or "https://github.com/owner/repo/tree/branch/skills"
+        cache_dir (Optional[Path]): Cache directory for GitHub repositories, defaults to DEFAULT_CACHE_DIR
+
+    Returns:
+        Dict[str, Dict[str, Any]]: Mapping from skill names to metadata containing
+        name, description, tool_list (as dict), usage content, skill_path, and asset_root.
+
+    Example:
+        >>> collect_skill_docs(Path("."))
+        {'tts': {'name': 'tts', 'desc': '...', 'tool_list': {...}, 'usage': '...', 'skill_path': '...'}}
+        >>> collect_skill_docs("https://github.com/muratcankoylan/Agent-Skills-for-Context-Engineering")
+        {'context-fundamentals': {...}, 'context-degradation': {...}, ...}
+    """
+    from aworld.skills.compat_provider import build_compat_registry
+
+    results: Dict[str, Dict[str, Any]] = {}
+    logger.info(f"🔍 Starting to collect skills from: {root_path}")
+
+    try:
+        registry = build_compat_registry(root_path, cache_dir=cache_dir)
+    except Exception as e:
+        logger.error(f"❌ Failed to resolve skill path {root_path}: {e}")
+        return results
+
+    for descriptor in registry.list_descriptors():
+        skill_name = descriptor.skill_name
+        if skill_name in results:
+            logger.warning(
+                f"⚠️ Duplicate skill name '{skill_name}' found at {descriptor.skill_file}, skipping"
+            )
+            continue
+
+        try:
+            skill_data = registry.build_skill_config(descriptor.skill_id)
+        except Exception as e:
+            logger.error(
+                f"❌ Failed to process skill file {descriptor.skill_file}: {e}"
+            )
+            continue
+
+        results[skill_name] = skill_data
+        logger.debug(f"✅ Collected skill: {skill_name}")
+
+    logger.info(f"✅ Total skill count: {len(results)} -> {list(results.keys())}")
+    return results
+
+
+# Backward-compatible re-export for callers that still import SkillRegistry
+# from aworld.utils.skill_loader while the implementation lives under aworld.skills.
+from aworld.skills.compat_registry import CompatSkillRegistry as SkillRegistry

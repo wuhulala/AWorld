@@ -1,0 +1,735 @@
+import asyncio
+import json
+import os
+import time
+import traceback
+from typing import Any, Dict, List, Optional
+
+from aworld.core.agent.base import AgentFactory
+from aworld.core.context.amni.prompt.assembly import (
+    AMNI_SYSTEM_SECTIONS_SCHEMA_VERSION,
+    DefaultPromptAssemblyProvider,
+    validated_amni_system_sections,
+)
+from aworld.memory.main import MemoryFactory
+from aworld.memory.models import MemorySystemMessage, MessageMetadata
+from ... import ApplicationContext
+from ...payload import SystemPromptMessagePayload
+from aworld.logs.util import logger
+from .base import BaseOp, MemoryCommand
+from .op_factory import memory_op
+from ...prompt.neurons import (
+    neuron_factory,
+    Neuron,
+    NeuronOutputOccurrence,
+    adapt_neuron_outputs,
+)
+from aworld.core.context.compiler import ContextObservationSidecar
+from aworld.agents.final_context_adapter import (
+    adapt_amni_folded_system_message,
+    adapt_amni_system_sections,
+)
+from ...prompt.prompt_ext import ContextPromptTemplate
+from ...retrieval.reranker import RerankResult
+from ...retrieval.reranker.factory import RerankerFactory
+
+
+@memory_op("system_prompt_augment")
+class SystemPromptAugmentOp(BaseOp):
+    """
+    System prompt formatting operator
+    Uses ContextPromptTemplate to enhance and format system prompts
+    Integrates prompt component processing logic, supporting both rerank and append strategies
+    """
+
+    def __init__(self, name: str = "system_prompt_augment", **kwargs):
+        super().__init__(name, **kwargs)
+        self._memory = MemoryFactory.instance()
+
+    async def execute(self, context: ApplicationContext, info: Dict[str, Any] = None, event: SystemPromptMessagePayload = None,
+                      **kwargs) -> Dict[str, Any]:
+        try:
+            # If system prompt existed, return
+            if await self.check_system_prompt_existed(context, event):
+                return {
+                    "memory_commands": []
+                }
+
+            # Get memory commands
+            if info:
+                memory_commands = info.get("memory_commands", [])
+            else:
+                memory_commands = []
+
+            # Process prompt components
+            augment_prompts = await self._process_neurons(context, event)
+
+            # Build system message command and return
+            system_command = await self.build_system_command(context, event, augment_prompts)
+            memory_commands.append(system_command)
+            return {
+                "memory_commands": memory_commands
+            }
+
+        except Exception as e:
+            logger.error(f"System prompt format error: {e} {traceback.format_exc()}")
+            return {
+                "memory_commands": []
+            }
+
+    async def _process_neurons(self, context: ApplicationContext, event: SystemPromptMessagePayload) -> Optional[Dict[str, Any]]:
+        """
+        Process prompt components, supporting both rerank and append strategies
+        Supports filtering components configured in component_neuron based on namespace
+        """
+        agent_id = getattr(event, 'agent_id', None)
+        agent_context_config = context.get_agent_context_config(agent_id)
+        agent = AgentFactory.agent_instance(agent_id)
+        if not agent:
+            return None
+        if not agent_context_config.enable_system_prompt_augment and not agent.ptc_tools:
+            logger.info(f"[SYSTEM_PROMPT_AUGMENT_OP] switch is disabled")
+            return None
+
+
+        augment_prompts = {}
+        neuron_output_occurrences: List[NeuronOutputOccurrence] = []
+
+        # Record timing for each component
+        component_timings = []
+        total_start_time = time.time()
+
+        # Get namespace (from event)
+        namespace = getattr(event, 'namespace', None)
+
+        # Process components
+        neuron_names = agent_context_config.neuron_names or []
+
+        # Enable PTC Feature
+        if agent.ptc_tools:
+            from aworld.experimental.ptc.ptc_neuron import PTC_NEURON_NAME
+            if PTC_NEURON_NAME not in neuron_names:
+               neuron_names.append(PTC_NEURON_NAME)
+
+        # Enable Skill Feature
+        if agent.skill_configs:
+            from aworld.core.context.amni.prompt.neurons.skill_neuron import SKILL_NEURON_NAME
+            if SKILL_NEURON_NAME not in neuron_names:
+                neuron_names.append(SKILL_NEURON_NAME)
+        
+        # Enable AWORLD.md File Feature
+        if agent_context_config.enable_aworld_file:
+            from aworld.core.context.amni.prompt.neurons.aworld_file_neuron import AWORLD_FILE_NEURON_NAME
+            from aworld.core.context.amni.prompt.neurons.relevant_memory_neuron import (
+                RELEVANT_MEMORY_NEURON_NAME,
+            )
+            if AWORLD_FILE_NEURON_NAME not in neuron_names:
+                neuron_names.insert(0, AWORLD_FILE_NEURON_NAME)  # High priority - insert at beginning
+            if RELEVANT_MEMORY_NEURON_NAME not in neuron_names:
+                insert_at = 1 if AWORLD_FILE_NEURON_NAME in neuron_names else 0
+                neuron_names.insert(insert_at, RELEVANT_MEMORY_NEURON_NAME)
+
+        # Enable Planing Feature
+        if agent_context_config.automated_reasoning_orchestrator:
+            from aworld.core.context.amni.prompt.neurons.todo_neuron import TODO_NEURON_NAME
+            if TODO_NEURON_NAME not in neuron_names:
+               neuron_names.append(TODO_NEURON_NAME)
+
+        # Enable Knowledge Feature
+        if agent_context_config.automated_cognitive_ingestion:
+            from aworld.core.context.amni.prompt.neurons.action_info_neuron import ACTION_INFO_NEURON_NAME
+            if ACTION_INFO_NEURON_NAME not in neuron_names:
+               neuron_names.append(ACTION_INFO_NEURON_NAME)
+
+        neurons = neuron_factory.get_neurons_by_names(names=neuron_names)
+
+
+        # Process components with rerank strategy
+        if neurons:
+            # Desc
+            for neuron in neurons:
+                augment_prompts[neuron.name] = await neuron.desc(context=context, namespace=namespace)
+
+            # Context
+
+            async def process_neuron(
+                neuron: Neuron,
+            ) -> tuple[str, str, float, Neuron, Any]:
+                """
+                Process a single neuron and return (component_name, timing_info, duration)
+                
+                Args:
+                    neuron: The neuron to process
+                    
+                Returns:
+                    Tuple of (component_name, timing_info, duration)
+                """
+                component_start_time = time.time()
+                component_name = neuron.__class__.__name__
+
+                try:
+                    # Context augment
+                    st = time.time()
+                    rerank_result = await self.rerank_items(neuron=neuron, context=context, namespace=namespace)
+                    # Read current value first, then update atomically
+                    current_prompt = augment_prompts[neuron.name]
+                    neuron_output = current_prompt + '\n\n' + rerank_result
+                    augment_prompts[neuron.name] = neuron_output
+                    t1 = time.time() - st
+                    logger.debug(
+                        f"🧠 _process_prompt_components rerank strategy: {component_name} rerank time: start_time={st}s format_time={t1:.3f}s")
+
+                    component_end_time = time.time()
+                    component_duration = component_end_time - component_start_time
+                    return (
+                        component_name,
+                        f"{component_name}:{component_duration:.3f}s",
+                        component_duration,
+                        neuron,
+                        neuron_output,
+                    )
+
+                except Exception as e:
+                    component_end_time = time.time()
+                    component_duration = component_end_time - component_start_time
+                    logger.error(f"Error processing rerank component {component_name}: {e} {traceback.format_exc()}")
+                    return (
+                        component_name,
+                        f"{component_name}:{component_duration:.3f}s(error)",
+                        component_duration,
+                        neuron,
+                        augment_prompts.get(neuron.name),
+                    )
+
+            # Execute all neurons in parallel
+            tasks = [process_neuron(neuron) for neuron in neurons]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process results and collect timings
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Unexpected error in parallel processing: {result} {traceback.format_exc()}")
+                    continue
+                component_name, timing_info, _, neuron, neuron_output = result
+                component_timings.append(timing_info)
+                if neuron_output is not None:
+                    neuron_output_occurrences.append(
+                        NeuronOutputOccurrence(
+                            neuron=neuron,
+                            output=neuron_output,
+                        )
+                    )
+
+        total_end_time = time.time()
+        total_duration = total_end_time - total_start_time
+
+        # Format timing information
+        timing_info = f"total:{total_duration:.3f}s, " + ", ".join(component_timings)
+
+        logger.info(
+            f"✅ Successfully processed {len(augment_prompts)} prompt components for agent {event.agent_id}, session {context.session_id}, timings: {timing_info}")
+
+        # Sort augment_prompts by neuron priority
+        if augment_prompts:
+            # Create sorted list of (priority, name, value) tuples
+            sorted_items = []
+            for name, value in augment_prompts.items():
+                priority = neuron_factory._prio.get(name, 0)
+                sorted_items.append((priority, name, value))
+            
+            # Sort by priority (lower number = higher priority)
+            sorted_items.sort(key=lambda x: x[0])
+            
+            # Rebuild dictionary in sorted order
+            augment_prompts = {name: value for _, name, value in sorted_items}
+
+        self._publish_neuron_context_observation(
+            context=context,
+            event=event,
+            occurrences=neuron_output_occurrences,
+        )
+
+        return augment_prompts
+
+    @staticmethod
+    def _publish_neuron_context_observation(
+        *,
+        context: ApplicationContext,
+        event: SystemPromptMessagePayload,
+        occurrences: List[NeuronOutputOccurrence],
+    ) -> None:
+        """Publish a pre-fold sidecar without changing legacy prompt assembly."""
+        publisher = getattr(context, "publish_context_observation", None)
+        if not callable(publisher):
+            return
+        namespace = getattr(event, "agent_id", None) or "unknown-agent"
+        source_identity = "amni://neuron-outputs"
+        try:
+            result = adapt_neuron_outputs(
+                occurrences,
+                source_identity=source_identity,
+                task_epoch=getattr(context, "task_epoch", None),
+            )
+            publisher(
+                ContextObservationSidecar.from_adapter_result(
+                    owner="amni.neuron_outputs",
+                    namespace=namespace,
+                    source_identity=source_identity,
+                    result=result,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Amni neuron Context observation failed; "
+                f"error_type={type(exc).__name__}"
+            )
+
+    async def rerank_items(self, neuron: Neuron, context: ApplicationContext,
+                           namespace: str) -> str:
+        user_query = context.task_input
+
+        st = time.time()
+        reranker = RerankerFactory.get_default_reranker()
+        score_threshold = self._get_score_threshold()
+        items = await neuron.format_items(context=context, namespace=namespace)
+        t1 = time.time() - st
+        # Only perform rerank when items is not empty
+        if not items:
+            return ""
+
+        # If length is not enough, no need to rerank, directly append
+        total_length = sum(len(item) for item in items)
+        if total_length <= 40000:
+            return await neuron.format(context=context, items=items, namespace=namespace)
+
+        # Only judge the first part of text
+        tmp_items = [item[:1000] for item in items]
+        rerank_results = await reranker.run(query=user_query, documents=tmp_items)
+        t2 = time.time() - st - t1
+        if rerank_results:
+            # Filter documents with scores greater than threshold
+            filtered_results = self._filter_by_score(rerank_results, score_threshold)
+            if filtered_results:
+                # Extract document content from filtered rerank results
+                reranked_docs = self._filter_items_by_rerank_result(items, rerank_results)
+                component_prompt = await neuron.format(context=context, items=reranked_docs, namespace=namespace)
+
+                logger.debug(f"Component {neuron}: "
+                             f"filtered {len(filtered_results)}/{len(rerank_results)} docs "
+                             f"with threshold {score_threshold}")
+                return component_prompt
+        t3 = time.time() - st - t1 - t2
+        logger.info(
+            f"🔄 _process_prompt_components: {neuron.__class__.__name__} rerank time: start_time={st}s format_time={t1:.3f}s, rerank_time={t2:.3f}s, filter_time={t3:.3f}s lens={[len(item) for item in items]}")
+        return ""
+
+    def _filter_items_by_rerank_result(self, items: List[str], rerank_results: RerankResult) -> List[str]:
+        filtered = []
+        target_ids = [rr.idx for rr in rerank_results]
+        for i, item in enumerate(items):
+            if i in target_ids:
+                filtered.append(item)
+        return filtered
+
+    def _get_score_threshold(self) -> float:
+        try:
+            threshold_str = os.environ.get('RERANKER_SCORE_THRESHOLD', '0.0')
+            threshold = float(threshold_str)
+            logger.debug(f"Using reranker score threshold: {threshold}")
+            return threshold
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                f"Invalid RERANKER_SCORE_THRESHOLD value: {os.environ.get('RERANKER_SCORE_THRESHOLD')}, using default 0.0. Error: {e}")
+            return 0.0
+
+    def _filter_by_score(self, rerank_results: List, score_threshold: float) -> List:
+        if not rerank_results:
+            return []
+
+        filtered_results = []
+        for result in rerank_results:
+            # Check if result object has score attribute
+            if hasattr(result, 'score') and result.score is not None:
+                if result.score > score_threshold:
+                    filtered_results.append(result)
+                else:
+                    logger.debug(f"⏭️ Filtered out document with score {result.score} (threshold: {score_threshold})")
+            else:
+                # If no score attribute, keep the result (backward compatible)
+                logger.warning(f"⚠️ Rerank result missing score attribute, keeping result: {result}")
+                filtered_results.append(result)
+
+        return filtered_results
+
+    async def build_system_command(self, context: ApplicationContext, event: SystemPromptMessagePayload, augment_prompts: Optional[Dict[str, Any]]) -> Optional[MemoryCommand]:
+        """
+        Build system message command
+        """
+        agent_id = event.agent_id
+        agent_name = event.agent_name
+        user_query = event.user_query
+
+        provider = self._get_prompt_assembly_provider(context, agent_id)
+        prompt_messages = self._build_system_prompt_messages(event.system_prompt, augment_prompts)
+        plan = provider.build_plan(
+            messages=prompt_messages,
+            tools=None,
+            metadata={
+                "system_section_hints": self._build_system_section_hints(
+                    event.system_prompt, augment_prompts
+                ),
+            },
+        )
+        appended_prompt = self._system_prompt_text(
+            getattr(plan, "to_model_messages", lambda: prompt_messages)()
+        )
+
+        formatted_system_prompt = await ContextPromptTemplate(template=appended_prompt).async_format(
+            context=context,
+            task=user_query)
+        formatted_sections = await self._format_ordered_system_sections(
+            context=context,
+            task=user_query,
+            plan=plan,
+        )
+        if "\n\n".join(
+            section["content"] for section in formatted_sections
+        ) != formatted_system_prompt:
+            # Formatting that depends on cross-section structure cannot be
+            # split without changing the model-visible prompt.
+            formatted_sections = []
+        try:
+            source_identity = (
+                f"amni-folded://{agent_id}/task-{context.task_id}/"
+                f"epoch-{context.task_epoch}"
+            )
+            context.publish_context_observation(
+                ContextObservationSidecar.from_adapter_result(
+                    owner="amni.folded_system",
+                    namespace=agent_id,
+                    source_identity=source_identity,
+                    result=adapt_amni_folded_system_message(
+                        content=formatted_system_prompt,
+                        source_identity=source_identity,
+                        task_id=context.task_id,
+                        task_epoch=context.task_epoch,
+                        agent_id=agent_id,
+                        dynamic=bool(augment_prompts),
+                    ),
+                    task_epoch=context.task_epoch,
+                )
+            )
+            if formatted_sections:
+                section_source_identity = f"{source_identity}/ordered-sections"
+                context.publish_context_observation(
+                    ContextObservationSidecar.from_adapter_result(
+                        owner="amni.system_sections",
+                        namespace=agent_id,
+                        source_identity=section_source_identity,
+                        result=adapt_amni_system_sections(
+                            sections=formatted_sections,
+                            source_identity=section_source_identity,
+                            task_id=context.task_id,
+                            task_epoch=context.task_epoch,
+                            agent_id=agent_id,
+                        ),
+                        task_epoch=context.task_epoch,
+                    )
+                )
+        except Exception as exc:
+            logger.warning(
+                "Amni folded-system Context publication failed; "
+                f"error_type={type(exc).__name__}"
+            )
+        # If not exist history, add new system message
+        system_message = await self._build_system_message(
+            context=context,
+            content=formatted_system_prompt,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            system_sections=formatted_sections,
+        )
+
+        return MemoryCommand(
+            type="ADD",
+            item=system_message,
+            memory_id=None
+        )
+
+    async def check_system_prompt_existed(self, context, event):
+        agent_id = event.agent_id
+        filters = {
+            "agent_id": agent_id
+        }
+
+        agent_memory_config = context.get_agent_memory_config(agent_id)
+
+        if not agent_memory_config:
+            agent = AgentFactory.agent_instance(agent_id)
+            if agent:
+                agent_memory_config = agent.conf.memory_config
+
+        query_scope = agent_memory_config.history_scope if agent_memory_config and agent_memory_config.history_scope else "task"
+        task = context.get_task()
+
+        if query_scope == "user":
+            # Pass user_id when query_scope is user
+            if hasattr(context, 'user_id') and context.user_id:
+                filters["user_id"] = context.user_id
+            elif hasattr(task, 'user_id') and task.user_id:
+                filters["user_id"] = task.user_id
+        elif query_scope == "session":
+            # Pass session_id when query_scope is session
+            if task and task.session_id:
+                filters["session_id"] = task.session_id
+        else:  # query_scope == "task" or default
+            # Pass task_id when query_scope is task
+            if task and task.session_id:
+                filters["session_id"] = task.session_id
+            if task and task.id:
+                filters["task_id"] = task.id
+
+        # Check history
+        histories = self._memory.get_last_n(0, filters=filters)
+        exists = bool(histories and len(histories) > 0)
+        if not exists:
+            return False
+
+        # Observation sidecars are deliberately not checkpointed.  Revalidate
+        # the exact folded system message from restored structured memory so an
+        # enforce rollout does not either trust opaque transcript text or fail
+        # merely because runtime-only evidence was correctly discarded.
+        has_folded_observation = any(
+            sidecar.owner in {
+                "amni.folded_system",
+                "amni.restored_folded_system",
+            }
+            and sidecar.namespace == agent_id
+            for sidecar in context.get_context_observations()
+        )
+        if not has_folded_observation:
+            restored_system = next(
+                (
+                    item
+                    for item in reversed(list(histories))
+                    if isinstance(item, MemorySystemMessage)
+                    and item.agent_id == agent_id
+                    and isinstance(item.content, str)
+                    and item.content
+                ),
+                None,
+            )
+            if restored_system is not None:
+                try:
+                    source_identity = (
+                        f"amni-restored-folded://{agent_id}/"
+                        f"task-{context.task_id}/epoch-{context.task_epoch}/"
+                        f"memory-{restored_system.id}"
+                    )
+                    context.publish_context_observation(
+                        ContextObservationSidecar.from_adapter_result(
+                            owner="amni.restored_folded_system",
+                            namespace=agent_id,
+                            source_identity=source_identity,
+                            result=adapt_amni_folded_system_message(
+                                content=restored_system.content,
+                                source_identity=source_identity,
+                                task_id=context.task_id,
+                                task_epoch=context.task_epoch,
+                                agent_id=agent_id,
+                                # Restored content may contain retrieval/memory
+                                # values, so it is conservatively dynamic.
+                                dynamic=True,
+                            ),
+                            task_epoch=context.task_epoch,
+                        )
+                    )
+                    stored_sections = validated_amni_system_sections(
+                        content=restored_system.content,
+                        metadata=restored_system.metadata,
+                    )
+                    if stored_sections:
+                        section_source_identity = (
+                            f"{source_identity}/ordered-sections"
+                        )
+                        context.publish_context_observation(
+                            ContextObservationSidecar.from_adapter_result(
+                                owner="amni.system_sections",
+                                namespace=agent_id,
+                                source_identity=section_source_identity,
+                                result=adapt_amni_system_sections(
+                                    sections=stored_sections,
+                                    source_identity=section_source_identity,
+                                    task_id=context.task_id,
+                                    task_epoch=context.task_epoch,
+                                    agent_id=agent_id,
+                                ),
+                                task_epoch=context.task_epoch,
+                            )
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Amni restored folded-system revalidation failed; "
+                        f"error_type={type(exc).__name__}"
+                    )
+        return True
+
+    async def _build_system_message(self,
+                                    context: ApplicationContext,
+                                    content: str,
+                                    agent_id: str,
+                                    agent_name: str = None,
+                                    system_sections: Optional[List[Dict[str, Any]]] = None,
+                                    ) -> MemorySystemMessage:
+        session_id = context.get_task().session_id
+        task_id = context.get_task().id
+        user_id = context.get_task().user_id
+
+        system_message = MemorySystemMessage(
+            content=content,
+            metadata=MessageMetadata(
+                session_id=session_id,
+                user_id=user_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                agent_name=agent_name or 'unknown',
+                ext_info=(
+                    {
+                        "aworld_context_system_sections": {
+                            "schema_version": AMNI_SYSTEM_SECTIONS_SCHEMA_VERSION,
+                            "sections": system_sections,
+                        }
+                    }
+                    if system_sections
+                    else {}
+                ),
+            )
+        )
+
+        return system_message
+
+    def _get_prompt_assembly_provider(self, context: ApplicationContext, agent_id: Optional[str]):
+        agent = AgentFactory.agent_instance(agent_id) if agent_id else None
+        provider_getter = getattr(context, "get_prompt_assembly_provider", None)
+        if callable(provider_getter):
+            return provider_getter(agent=agent)
+
+        provider = getattr(context, "prompt_assembly_provider", None)
+        if provider is not None:
+            return provider
+
+        if agent is not None:
+            provider = getattr(agent, "prompt_assembly_provider", None)
+            if provider is not None:
+                return provider
+
+        return DefaultPromptAssemblyProvider()
+
+    @staticmethod
+    def _build_system_prompt_messages(
+        system_prompt: Optional[str],
+        augment_prompts: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        for prompt in (augment_prompts or {}).values():
+            if prompt:
+                messages.append({"role": "system", "content": prompt})
+        return messages
+
+    @staticmethod
+    def _build_system_section_hints(
+        system_prompt: Optional[str],
+        augment_prompts: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        hints = []
+        if system_prompt:
+            hints.append({"name": "system_prompt", "stability": "stable"})
+        for name in (augment_prompts or {}).keys():
+            hints.append({"name": name})
+        return hints
+
+    @classmethod
+    def _system_prompt_text(cls, messages: Any) -> str:
+        system_parts = []
+        for message in messages or []:
+            if isinstance(message, dict) and message.get("role") == "system":
+                content = cls._stringify_system_content(message.get("content"))
+                if content:
+                    system_parts.append(content)
+        return "\n\n".join(system_parts)
+
+    async def _format_ordered_system_sections(
+        self,
+        *,
+        context: ApplicationContext,
+        task: Any,
+        plan: Any,
+    ) -> List[Dict[str, Any]]:
+        sections = getattr(plan, "system_sections", None)
+        if not isinstance(sections, list) or not sections:
+            return []
+        formatted = []
+        for section in sections:
+            content = self._stringify_system_content(
+                getattr(section, "content", {}).get("content")
+                if isinstance(getattr(section, "content", None), dict)
+                else getattr(section, "content", None)
+            )
+            stability = getattr(section, "stability", None)
+            if not content or stability not in {"stable", "dynamic"}:
+                return []
+            rendered = await ContextPromptTemplate(template=content).async_format(
+                context=context,
+                task=task,
+            )
+            if not isinstance(rendered, str) or not rendered:
+                return []
+            formatted.append(
+                {
+                    "name": getattr(section, "name", None),
+                    "stability": stability,
+                    "content": rendered,
+                }
+            )
+        return formatted
+
+    @staticmethod
+    def _stringify_system_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif item is not None:
+                    parts.append(json.dumps(item, ensure_ascii=False, default=str))
+            return "\n".join(part for part in parts if part)
+        if content is None:
+            return ""
+        return json.dumps(content, ensure_ascii=False, default=str)
+
+    def _assemble_system_prompt(
+        self,
+        *,
+        provider: Any,
+        messages: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if not messages:
+            return ""
+
+        plan = provider.build_plan(messages=messages, tools=None, metadata=metadata or {})
+        assembled_messages = (
+            plan.to_model_messages()
+            if hasattr(plan, "to_model_messages")
+            else getattr(plan, "messages", messages)
+        )
+
+        assembled = self._system_prompt_text(assembled_messages)
+        if assembled:
+            return assembled
+
+        return self._system_prompt_text(messages)

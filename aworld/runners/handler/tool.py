@@ -1,0 +1,175 @@
+# coding: utf-8
+# Copyright (c) 2025 inclusionAI.
+import abc
+import traceback
+from typing import AsyncGenerator
+
+from aworld.config import ConfigDict
+from aworld.core.agent.base import is_agent
+from aworld.core.common import ActionModel, TaskItem, Observation, ActionResult
+from aworld.core.event.base import Message, Constants, TopicType, AgentMessage, MemoryEventMessage, MemoryEventType
+from aworld.core.tool.base import AsyncTool, Tool, ToolFactory, maybe_await
+from aworld.events.util import send_message_with_future
+from aworld.logs.util import logger
+from aworld.runners import HandlerFactory
+from aworld.runners.handler.base import DefaultHandler
+
+
+class ToolHandler(DefaultHandler):
+    __metaclass__ = abc.ABCMeta
+
+    def __init__(self, runner: 'TaskEventRunner'):
+        super().__init__(runner)
+        self.tools = runner.tools
+        self.tools_conf = runner.tools_conf
+
+    @classmethod
+    def name(cls):
+        return "_tool_handler"
+
+
+@HandlerFactory.register(name=f'__{Constants.TOOL}__')
+class DefaultToolHandler(ToolHandler):
+    def is_valid_message(self, message: Message):
+        if message.category != Constants.TOOL:
+            return False
+        return True
+
+    async def _do_handle(self, message: Message) -> AsyncGenerator[Message, None]:
+        headers = {"context": message.context}
+        # data is List[ActionModel]
+        data = message.payload
+        if not data:
+            # error message, p2p
+            yield Message(
+                category=Constants.TASK,
+                payload=TaskItem(msg="no data to process.", data=data, stop=True),
+                sender='agent_handler',
+                session_id=message.session_id,
+                topic=TopicType.ERROR,
+                headers=headers
+            )
+            return
+
+        for action in data:
+            if not isinstance(action, ActionModel):
+                # error message, p2p
+                yield Message(
+                    category=Constants.TASK,
+                    payload=TaskItem(msg="action not a ActionModel.", data=data, stop=True),
+                    sender=self.name(),
+                    session_id=message.session_id,
+                    topic=TopicType.ERROR,
+                    headers=headers
+                )
+                return
+
+        new_tools = dict()
+        tool_mapping = dict()
+        # Directly use or use tools after creation.
+        for act in data:
+            if is_agent(act):
+                logger.warning(f"somethings wrong, {act} is an agent.")
+                continue
+
+            if self.tool_need_registered(act.tool_name, message) and act.tool_name not in tool_mapping:
+                # dynamic only use default config in module.
+                conf = self.tools_conf.get(act.tool_name)
+                if isinstance(conf, dict):
+                    conf = ConfigDict(conf)
+                try:
+                    tool = ToolFactory(act.tool_name, conf=conf, asyn=conf.use_async if conf else False)
+                    tool.event_driven = True
+                    tool.context = message.context
+                    if isinstance(tool, Tool):
+                        tool.reset()
+                    elif isinstance(tool, AsyncTool):
+                        await maybe_await(tool.reset())
+                    tool_mapping[act.tool_name] = []
+                    self.tools[act.tool_name] = tool
+                    new_tools[act.tool_name] = tool
+                except Exception as e:
+                    logger.error(f"create tool {act.tool_name} failed: {str(e)}")
+                    err_msg = f"Failed to execute {act.tool_name}: {str(e)}"
+                    # add tool result to memory
+                    tool_res = ActionResult(
+                        tool_name=act.tool_name,
+                        tool_call_id=act.tool_call_id,
+                        content=err_msg,
+                        error=str(e),
+                        success=False
+                    )
+                    receiver_agent = message.context.swarm.agents.get(act.agent_name)
+                    memory_msg = MemoryEventMessage(
+                        payload=tool_res,
+                        agent=receiver_agent,
+                        memory_event_type=MemoryEventType.TOOL,
+                        headers={"context": message.context}
+                    )
+                    try:
+                        future = await send_message_with_future(memory_msg)
+                        results = await future.wait(context=message.context)
+                        if not results:
+                            logger.warning(f"Memory write task failed: {memory_msg}")
+                    except Exception as e:
+                        logger.warn(f"Memory write task failed: {traceback.format_exc()}")
+
+                    # send message to agent
+                    yield AgentMessage(
+                        category=Constants.AGENT,
+                        payload=Observation(
+                            content=err_msg,
+                            action_result=[tool_res]
+                        ),
+                        sender=act.tool_name,
+                        session_id=message.session_id,
+                        receiver=act.agent_name,
+                        headers=message.headers
+                    )
+                    return
+            if act.tool_name not in tool_mapping:
+                tool_mapping[act.tool_name] = []
+            tool_mapping[act.tool_name].append(act)
+
+        if new_tools:
+            yield Message(
+                category=Constants.TASK,
+                payload=TaskItem(data=new_tools),
+                sender=self.name(),
+                session_id=message.session_id,
+                topic=TopicType.SUBSCRIBE_TOOL,
+                # Dynamic registration must run before the first real tool invocation,
+                # otherwise the tool message can be consumed first and recurse back
+                # into DefaultToolHandler before the receiver is subscribed.
+                priority=message.priority - 1,
+                headers=headers
+            )
+
+        for tool_name, actions in tool_mapping.items():
+            if not (isinstance(self.tools[tool_name], Tool) or isinstance(self.tools[tool_name], AsyncTool)):
+                logger.warning(f"Unsupported tool type: {self.tools[tool_name]}")
+                continue
+            self.tools[tool_name].context = message.context
+
+            # send to the tool
+            yield Message(
+                category=Constants.TOOL,
+                payload=actions,
+                sender=actions[0].agent_name if actions else '',
+                session_id=message.session_id,
+                receiver=tool_name,
+                priority=message.priority,
+                headers=message.headers
+            )
+
+    def tool_need_registered(self, tool_name: str, message: Message):
+        tool_handlers = self.runner.event_mng.get_handlers(Constants.TOOL)
+        if tool_handlers and tool_handlers.get(tool_name):
+            return False
+        return True
+
+    async def post_handle(self, input:Message, output: Message) -> Message:
+        new_context = output.context.deep_copy(preserve_merge_baseline=True)
+        new_context._task = output.context.get_task()
+        output.context = new_context
+        return output

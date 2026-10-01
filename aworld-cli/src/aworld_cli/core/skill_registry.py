@@ -1,0 +1,497 @@
+"""
+Global SkillRegistry manager for aworld-cli.
+
+Provides a singleton SkillRegistry instance that automatically loads skills from
+the default skills directory (./skills) and supports registering additional sources
+from environment variables or programmatic configuration.
+"""
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+from aworld.skills.compat_registry import CompatSkillRegistry
+from aworld.skills.release import is_self_evolve_release_visible
+from aworld_cli.core.installed_skill_manager import InstalledSkillManager
+from aworld_cli.core.plugin_manager import get_plugin_skills_dir
+
+from aworld.logs.util import logger
+from aworld.utils.skill_loader import DEFAULT_CACHE_DIR
+
+
+class SkillRegistry(CompatSkillRegistry):
+    """CLI compatibility registry backed by framework-powered `collect_skill_docs()`."""
+    pass
+
+
+# Global SkillRegistry instance
+_global_registry: Optional[SkillRegistry] = None
+
+# Environment variable names
+ENV_SKILLS_PATH = "SKILLS_PATH"  # Semicolon-separated list of skill sources
+ENV_SKILLS_DIR = "SKILLS_DIR"    # Single skills directory (legacy, for backward compatibility)
+ENV_SKILLS_CACHE_DIR = "SKILLS_CACHE_DIR"  # Custom cache directory for GitHub repos
+
+
+def resolve_repo_aworld_skills_path() -> Path | None:
+    """Resolve the repo-local `aworld-skills` directory when running from source."""
+    candidate = Path(__file__).resolve().parents[4] / "aworld-skills"
+    if candidate.exists() and candidate.is_dir():
+        return candidate.resolve()
+    return None
+
+
+def get_default_skill_source_paths() -> List[Path]:
+    """Return the default runtime-visible skill roots when no env override is set."""
+    paths: List[Path] = [(Path.home() / ".aworld" / "skills").resolve()]
+    repo_aworld_skills = resolve_repo_aworld_skills_path()
+    if repo_aworld_skills is not None:
+        paths.append(repo_aworld_skills)
+    return paths
+
+
+def get_user_skills_paths() -> List[Path]:
+    """
+    Return the list of directories where user skills are stored.
+
+    Resolution order:
+    1. SKILLS_PATH env (semicolon-separated list of paths)
+    2. SKILLS_DIR env (legacy, single directory) is appended if set
+
+    Returns:
+        List of resolved Paths; directories may or may not exist.
+
+    Example:
+        >>> paths = get_user_skills_paths()
+        >>> for p in paths:
+        ...     collect_skill_docs(p)
+    """
+    paths: List[Path] = []
+    skills_path_env = os.getenv(ENV_SKILLS_PATH)
+    if skills_path_env:
+        paths = [
+            Path(os.path.expanduser(s.strip())).resolve()
+            for s in skills_path_env.split(";")
+            if s.strip()
+        ]
+    skills_dir_env = os.getenv(ENV_SKILLS_DIR)
+    if skills_dir_env:
+        paths.append(Path(os.path.expanduser(skills_dir_env)).resolve())
+
+    if not paths:
+        paths = get_default_skill_source_paths()
+
+    deduped_paths: List[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        deduped_paths.append(path)
+        seen.add(path)
+    return deduped_paths
+
+
+def collect_plugin_and_user_skills(
+    plugin_base_dir: Path,
+    user_dir: Optional[Union[str, Path]] = None,
+    agent_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Collect skills from plugin skills dir and user skills dirs, with dedup,
+    compatibility field normalization, and aworld_metadata filter.
+
+    Resolution order:
+    1. Plugin skills dir: plugin_base_dir/skills (e.g. builtin_agents/smllc/skills)
+    2. User skills dirs: user_dir (if set, semicolon-separated) + SKILLS_PATH / SKILLS_DIR
+       are merged after plugin skills; duplicate names are skipped for compatibility
+    3. Installed skill entries: global for all agents, agent:<name> only for matching agent
+    4. Each skill gets skill_path/asset_root preserved for runtime compatibility
+    5. Only skills with aworld_metadata.eligible=True (or no aworld_metadata) are included
+
+    Args:
+        plugin_base_dir: Plugin or built-in agent bundle root path.
+        user_dir: Optional user skills dir(s); semicolon-separated for multiple paths. Loaded first (highest priority). Default None.
+        agent_name: Optional current agent name used to include matching installed agent-scoped skills.
+
+    Returns:
+        Dict mapping skill name to skill config (ready for AgentConfig.skill_configs).
+    """
+    plugin_skills_dir = get_plugin_skills_dir(plugin_base_dir)
+    logger.info(f"agent_config: {plugin_base_dir} user_dir: {user_dir}")
+
+    registry = SkillRegistry()
+    if plugin_skills_dir.exists() and plugin_skills_dir.is_dir():
+        try:
+            count = registry.register_source(plugin_skills_dir, source_name=str(plugin_skills_dir))
+            if count > 0:
+                logger.info(f"✅ Loaded {count} skill(s) from plugin path: {plugin_skills_dir}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load skills from plugin path '{plugin_skills_dir}': {e}")
+
+    user_paths: List[Path] = list(get_user_skills_paths())
+    if user_dir:
+        parts = [s.strip() for s in str(user_dir).split(";") if s.strip()]
+        for p in reversed(parts):
+            user_paths.insert(0, Path(os.path.expanduser(p)).resolve())
+
+    for user_skills_path in user_paths:
+        if not user_skills_path.exists() or not user_skills_path.is_dir():
+            continue
+        try:
+            count = registry.register_source(user_skills_path, source_name=str(user_skills_path))
+            if count > 0:
+                logger.info(f"✅ Loaded {count} skill(s) from user path: {user_skills_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load skills from '{user_skills_path}': {e}")
+
+    installed_skill_manager = InstalledSkillManager()
+    for install in sorted(
+        installed_skill_manager.list_installs(include_disabled=False),
+        key=lambda item: str(item.get("install_id", "")),
+    ):
+        scope = install.get("scope")
+        if not (
+            scope == "global"
+            or (
+                isinstance(scope, str)
+                and scope.startswith("agent:")
+                and agent_name is not None
+                and scope == f"agent:{agent_name}"
+            )
+        ):
+            continue
+
+        source_path = install.get("resolved_skill_source_path")
+        install_id = install.get("install_id", "<unknown>")
+        if not isinstance(source_path, str) or not source_path:
+            logger.warning(
+                f"⚠️ Installed skill entry '{install_id}' has no resolved source path, skipping"
+            )
+            continue
+
+        try:
+            count = registry.register_source(source_path, source_name=source_path)
+            if count > 0:
+                logger.info(
+                    f"✅ Loaded {count} skill(s) from installed source '{install_id}'"
+                )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Failed to load skills from installed source '{install_id}': {e}"
+            )
+
+    all_skills: Dict[str, Any] = {}
+    for skill_name, skill_config in registry.get_all_skills().items():
+        if not is_self_evolve_release_visible(skill_config):
+            continue
+        aworld_meta = skill_config.get("aworld_metadata")
+        if aworld_meta is None:
+            all_skills[skill_name] = skill_config
+            continue
+        if aworld_meta.get("eligible", True):
+            all_skills[skill_name] = skill_config
+        else:
+            missing = aworld_meta.get("missing") or {}
+            install_opts = aworld_meta.get("install_options") or []
+            install_hint = ""
+            if install_opts:
+                labels = [o.get("label") or o.get("kind") for o in install_opts if o.get("label") or o.get("kind")]
+                if labels:
+                    install_hint = f" Install: {'; '.join(labels)}."
+            logger.warning(
+                f"⚠️ Skill '{skill_name}' skipped (requirements not satisfied): missing={missing}.{install_hint}"
+            )
+    return all_skills
+
+
+def build_skill_resolver_inputs(
+    plugin_base_dir: Optional[Union[str, Path]] = None,
+    user_dir: Optional[Union[str, Path]] = None,
+    skill_names: Optional[Union[str, List[str], tuple[str, ...]]] = None,
+) -> Dict[str, List[str]]:
+    """
+    Build resolver hint payloads for task-time skill resolution.
+
+    This is the compatibility bridge for agent definitions that previously assembled
+    eager `skill_configs`. It intentionally carries only source hints and selection
+    patterns, leaving final skill materialization to SkillActivationResolver.
+    """
+
+    def _dedupe(values: List[str]) -> List[str]:
+        ordered: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = value.strip()
+            if not normalized or normalized in seen:
+                continue
+            ordered.append(normalized)
+            seen.add(normalized)
+        return ordered
+
+    plugin_roots: List[str] = []
+    compatibility_sources: List[str] = []
+    compatibility_skill_patterns: List[str] = []
+
+    if plugin_base_dir:
+        plugin_root = Path(plugin_base_dir).expanduser().resolve()
+        plugin_roots.append(str(plugin_root))
+
+    if user_dir:
+        for raw_source in str(user_dir).split(";"):
+            source = raw_source.strip()
+            if not source:
+                continue
+            if "github.com" in source or source.startswith("git@"):
+                compatibility_sources.append(source)
+                continue
+            compatibility_sources.append(
+                str(Path(os.path.expanduser(source)).resolve())
+            )
+
+    if skill_names:
+        if isinstance(skill_names, str):
+            compatibility_skill_patterns.extend(
+                part.strip()
+                for part in skill_names.split(";")
+                if part.strip()
+            )
+        else:
+            compatibility_skill_patterns.extend(
+                str(part).strip()
+                for part in skill_names
+                if str(part).strip()
+            )
+
+    return {
+        "plugin_roots": _dedupe(plugin_roots),
+        "compatibility_sources": _dedupe(compatibility_sources),
+        "compatibility_skill_patterns": _dedupe(compatibility_skill_patterns),
+    }
+
+
+def get_skill_registry(
+    skills_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    skill_paths: Optional[List[str]] = None,
+    auto_init: bool = True
+) -> SkillRegistry:
+    """
+    Get or initialize the global SkillRegistry instance.
+    
+    On first call, automatically registers skill sources from:
+    1. Provided parameters (skill_paths)
+    2. Environment variables (SKILLS_PATH, SKILLS_DIR)
+    3. Default skills directory (./skills) if exists
+    4. Installed global skill entries
+    
+    Subsequent calls return the same instance.
+    
+    Args:
+        skills_dir: Optional custom skills directory to use as default.
+            If None, uses "./skills" relative to current working directory.
+        cache_dir: Optional cache directory for GitHub repositories.
+            If None, uses DEFAULT_CACHE_DIR or SKILLS_CACHE_DIR env var.
+        skill_paths: Optional list of skill source paths to register.
+            Can be local paths or GitHub URLs.
+        auto_init: If True, automatically register default skills directory and env vars.
+            If False, return registry without auto-initialization.
+    
+    Returns:
+        Global SkillRegistry instance
+        
+    Example:
+        >>> registry = get_skill_registry()
+        >>> # Register additional source
+        >>> registry.register_source("https://github.com/user/repo")
+        >>> # Get skills by name
+        >>> skills = registry.get_all_skills()
+    """
+    global _global_registry
+    
+    if _global_registry is None:
+        if cache_dir is None:
+            env_cache_dir = os.getenv(ENV_SKILLS_CACHE_DIR)
+            cache_dir = (
+                Path(os.path.expanduser(env_cache_dir))
+                if env_cache_dir
+                else DEFAULT_CACHE_DIR
+            )
+        _global_registry = SkillRegistry(cache_dir=cache_dir)
+
+    if auto_init:
+        if skill_paths:
+            for skill_path in skill_paths:
+                try:
+                    count = _global_registry.register_source(
+                        skill_path,
+                        source_name=skill_path,
+                    )
+                    if count > 0:
+                        logger.info(f"📚 Registered skill source: {skill_path} ({count} skills)")
+                    logger.info(f"📚 Registered skill source from parameter: {skill_path}")
+                except Exception as e:
+                    logger.error(f"⚠️ Failed to register skill source '{skill_path}': {e}")
+                    logger.warning(f"⚠️ Failed to register skill source '{skill_path}': {e}")
+
+        _register_from_env(_global_registry)
+
+        for user_skills_path in get_user_skills_paths():
+            if not user_skills_path.exists() or not user_skills_path.is_dir():
+                continue
+            try:
+                count = _global_registry.register_source(
+                    str(user_skills_path),
+                    source_name=str(user_skills_path),
+                )
+                if count > 0:
+                    logger.info(
+                        f"📚 Registered user skills directory: {user_skills_path} ({count} skills)"
+                    )
+            except Exception as e:
+                logger.debug(
+                    f"ℹ️ User skills directory already registered or failed: {user_skills_path}: {e}"
+                )
+
+        if skills_dir is None:
+            default_skills_dir = Path.cwd() / "skills"
+        else:
+            default_skills_dir = Path(skills_dir).resolve()
+
+        if default_skills_dir.exists() and default_skills_dir.is_dir():
+            try:
+                from .._globals import console
+
+                count = _global_registry.register_source(
+                    str(default_skills_dir),
+                    source_name="default_skills",
+                )
+                if count > 0:
+                    console.print(
+                        f"[dim]📚 Registered default skills directory: "
+                        f"{default_skills_dir} ({count} skills)[/dim]"
+                    )
+                logger.info(
+                    f"📚 Auto-registered default skills directory: "
+                    f"{default_skills_dir} ({count} skills)"
+                )
+            except Exception as e:
+                logger.debug(
+                    f"ℹ️ Default skills directory already registered or failed: "
+                    f"{default_skills_dir}: {e}"
+                )
+        else:
+            logger.debug(
+                f"ℹ️ Default skills directory not found: {default_skills_dir}, "
+                "skipping auto-registration"
+            )
+
+        _register_installed_sources(_global_registry)
+    
+    return _global_registry
+
+
+def _register_from_env(registry: SkillRegistry) -> None:
+    """
+    Register skill sources from environment variables.
+    
+    Args:
+        registry: SkillRegistry instance to register sources to
+    """
+    # Register from SKILLS_PATH (semicolon-separated list)
+    skills_path_env = os.getenv(ENV_SKILLS_PATH)
+    if skills_path_env:
+        skill_sources = [s.strip() for s in skills_path_env.split(';') if s.strip()]
+        for source in skill_sources:
+            try:
+                count = registry.register_source(source, source_name=source)
+                if count > 0:
+                    logger.info(f"📚 Registered skill source from {ENV_SKILLS_PATH}: {source} ({count} skills)")
+                logger.info(f"📚 Registered skill source from {ENV_SKILLS_PATH}: {source}")
+            except Exception as e:
+                print(f"⚠️ Failed to register skill source from env '{source}': {e}")
+                logger.warning(f"⚠️ Failed to register skill source from env '{source}': {e}")
+    
+    # Register from SKILLS_DIR (legacy, single directory for backward compatibility)
+    skills_dir_env = os.getenv(ENV_SKILLS_DIR)
+    if skills_dir_env:
+        try:
+            # Expand ~ in path if present
+            skills_dir_path = Path(os.path.expanduser(skills_dir_env)).resolve()
+            if skills_dir_path.exists() and skills_dir_path.is_dir():
+                count = registry.register_source(str(skills_dir_path), source_name=str(skills_dir_path))
+                if count > 0:
+                    logger.info(f"📚 Registered skill source from {ENV_SKILLS_DIR}: {skills_dir_path} ({count} skills)")
+                logger.info(f"📚 Registered skill source from {ENV_SKILLS_DIR}: {skills_dir_path}")
+            else:
+                logger.warning(f"⚠️ {ENV_SKILLS_DIR} directory not found: {skills_dir_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to register skill source from {ENV_SKILLS_DIR}: {e}")
+            logger.warning(f"⚠️ Failed to register skill source from {ENV_SKILLS_DIR}: {e}")
+
+
+def _register_installed_sources(registry: SkillRegistry) -> None:
+    """Register installed global skill sources after higher-priority sources."""
+    manager = InstalledSkillManager()
+
+    for install in sorted(
+        manager.list_installs(include_disabled=False),
+        key=lambda item: str(item["install_id"]),
+    ):
+        if install.get("scope") != "global":
+            continue
+
+        source = install["resolved_skill_source_path"]
+        try:
+            count = registry.register_source(source, source_name=source)
+            if count > 0:
+                logger.info(f"📚 Registered installed global skill source: {source} ({count} skills)")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to register installed global skill source '{source}': {e}")
+
+
+def reset_skill_registry() -> None:
+    """
+    Reset the global SkillRegistry instance.
+    
+    Useful for testing or when you need to reinitialize the registry.
+    
+    Example:
+        >>> reset_skill_registry()
+        >>> registry = get_skill_registry(skills_dir="./new_skills")
+    """
+    global _global_registry
+    _global_registry = None
+
+
+def resolve_explicit_skill_sources(
+    skill_paths: List[str],
+    *,
+    cache_dir: Optional[Path] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Resolve explicit skill sources without mutating the global SkillRegistry singleton.
+
+    Earlier runtime paths registered ad hoc sources into the process-global registry as a
+    side effect. The resolver-based flow needs a read-only view instead.
+    """
+    registry = CompatSkillRegistry(cache_dir=cache_dir)
+    for skill_path in skill_paths:
+        registry.register_source(skill_path, source_name=skill_path)
+    return registry.get_all_skills()
+
+
+def register_skill_source(source: str, source_name: Optional[str] = None) -> int:
+    """
+    Register a skill source (local path or GitHub URL) in the global registry.
+    
+    Args:
+        source: Local path or GitHub URL
+        source_name: Optional name for the source
+        
+    Returns:
+        Number of skills loaded
+        
+    Example:
+        >>> register_skill_source("https://github.com/muratcankoylan/Agent-Skills-for-Context-Engineering")
+    """
+    registry = get_skill_registry()
+    return registry.register_source(source, source_name=source_name)

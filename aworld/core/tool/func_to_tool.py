@@ -1,0 +1,339 @@
+# coding: utf-8
+# Copyright (c) 2025 inclusionAI.
+import importlib
+import importlib.util
+import inspect
+import os
+import sys
+import tempfile
+import uuid
+import getpass
+from pathlib import Path
+from typing import Callable, Any, get_type_hints, get_origin, get_args
+
+from pydantic import create_model, Field, BaseModel
+from pydantic.fields import FieldInfo
+
+from aworld.core.common import ParamInfo
+from aworld.core.tool.action import TOOL_ACTION
+from aworld.core.tool.action_factory import ActionFactory
+from aworld.core.tool.action_template import ACTION_TEMPLATE
+from aworld.core.tool.base import ToolFactory
+from aworld.core.tool.tool_template import TOOL_TEMPLATE
+from aworld.logs.util import logger
+from aworld.tools import (
+    LOCAL_TOOLS_ENV_VAR,
+    encode_local_tool_entries,
+    encode_local_tool_entry,
+    prune_missing_local_tool_entries,
+)
+
+
+GENERATED_TOOL_DIR_ENV_VAR = "AWORLD_TOOL_TMP_DIR"
+
+
+def _get_generated_tool_dir_name() -> str:
+    """Return a user-scoped directory name for runtime-generated tool modules."""
+    username = (getpass.getuser() or "unknown").strip() or "unknown"
+    safe_username = "".join(
+        ch if ch.isalnum() or ch in {"-", "_", "."} else "_"
+        for ch in username
+    )
+    uid_getter = getattr(os, "getuid", None)
+    uid_suffix = f"_{uid_getter()}" if callable(uid_getter) else ""
+    return f"aworld_local_tools_{safe_username}{uid_suffix}"
+
+
+def _get_generated_tool_dir() -> Path:
+    """Return the directory used for runtime-generated tool modules."""
+    configured_dir = (os.environ.get(GENERATED_TOOL_DIR_ENV_VAR) or "").strip()
+    if configured_dir:
+        output_dir = Path(os.path.expanduser(configured_dir))
+    else:
+        output_dir = Path(tempfile.gettempdir()) / _get_generated_tool_dir_name()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _load_module_from_path(module_name: str, file_path: str):
+    """Load a module from an absolute or resolved file path.
+
+    Plain importlib.import_module() only searches sys.path; @be_tool writes
+    generated files outside the repo workspace, so direct path loading is
+    required even when cwd is not on sys.path.
+    """
+    path = os.path.abspath(file_path)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module {module_name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def be_tool(
+        tool_name: str = None,
+        tool_desc: str = None,
+        name: str = None,
+        desc: str = None, **kwargs
+) -> Callable[..., Any]:
+    """Decorate a function to be a tool, auto register the tool and action with the parameters with the factory.
+
+    Example:
+        >>> @be_tool()
+        >>> def example():
+        >>>     return "example"
+
+        # write name and description
+        >>> @be_tool(name="param", desc="example param func")
+        >>> def example_param(param: str):
+        >>>     return param
+
+        >>> @be_tool(tool_name='field_param_tool')
+        >>> def example_param_field(param: str = Field(..., description="param")):
+        >>>     return param
+
+        >>> @be_tool(tool_name='field_param_tool')
+        >>> def example_param_2(param: str = Field(..., description="param")):
+        >>>     return param
+
+    Args:
+        tool_name: Optional name for the tool.
+        tool_desc: Optional description for the tool.
+        name: Optional name for the function.
+        desc: Optional description of function.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        # converts python function into a tool with associated actions
+        function_to_tool(
+            func,
+            tool_name=tool_name,
+            tool_desc=tool_desc,
+            name=name,
+            desc=desc,
+            **kwargs
+        )
+        return func
+
+    return decorator
+
+
+def function_to_tool(
+        func: Callable[..., Any],
+        tool_name: str = None,
+        tool_desc: str = None,
+        name: str = None,
+        desc: str = None,
+        **kwargs
+) -> None:
+    """Transform a python function into a tool, and register to the factory.
+
+    Generates necessary code files dynamically and manages tool and action registration.
+
+    Args：
+        func: An executable function.
+        tool_name: The name of the tool that is transformed by the function.
+        tool_desc: The description of the tool what it can do, default the same as tool_name.
+        name: Alias name of function.
+        desc: The description of the function what it can do, default the same as name.
+    """
+    tool_name = tool_name or name or func.__name__
+    action_name = name or func.__name__
+
+    postfix = f"{uuid.uuid4().hex[0:6]}__tmp"
+    output_dir = _get_generated_tool_dir()
+
+    action_module_name = f"{action_name}{postfix}_action"
+    action_py_path = str((output_dir / f"{action_module_name}.py").resolve())
+
+    with open(action_py_path, 'w') as write:
+        write.writelines("from __future__ import annotations\n")
+        write.writelines("from typing import *\n")
+        write.writelines("from pydantic import Field\n\n")
+        if func.__module__ != '__main__':
+            write.writelines(
+                "import importlib as _aworld_importlib\n"
+                f"_aworld_source_module = _aworld_importlib.import_module({func.__module__!r})\n"
+                "for _aworld_name, _aworld_value in vars(_aworld_source_module).items():\n"
+                "    if not _aworld_name.startswith('__'):\n"
+                "        globals().setdefault(_aworld_name, _aworld_value)\n"
+                "del _aworld_importlib, _aworld_source_module, _aworld_name, _aworld_value\n\n"
+            )
+        lines = inspect.getsourcelines(func)[0]
+        for idx, line in enumerate(lines):
+            if line.startswith("def ") or line.startswith("async def "):
+                break
+        write.writelines("".join(lines[idx:]))
+
+    if tool_name == "<lambda>" or action_name == "<lambda>":
+        raise ValueError("You must provide a name for lambda functions")
+
+    func_name = func.__name__
+    is_async = inspect.iscoroutinefunction(func)
+
+    name = action_name
+    # build action
+    if action_name not in ActionFactory:
+        con = ACTION_TEMPLATE.format(name=action_name,
+                                     desc_literal=repr(desc if desc else action_name),
+                                     tool_name=tool_name,
+                                     sync_call=(
+                                         f"sync_exec({func_name}, **action.params)"
+                                         if is_async else f"{func_name}(**action.params)"
+                                     ),
+                                     async_call=(
+                                         f"await {func_name}(**action.params)"
+                                         if is_async else f"{func_name}(**action.params)"
+                                     ),
+                                     call_func=func_name)
+        with open(action_py_path, 'a+') as write:
+            write.writelines(con)
+        module = _load_module_from_path(action_module_name, action_py_path)
+        getattr(module, f"{action_name}Act")
+    else:
+        logger.warning(f"{action_name} already register to the tool.")
+        raise ValueError(f"{action_name} already register to a tool.")
+
+    # build params info
+    parameters = func_params(func)
+
+    module_name = f'{tool_name}'
+    tool_py_path = str((output_dir / f"{tool_name}{postfix}.py").resolve())
+    expected_action_cls = f"{tool_name}Action"
+    existing_module = sys.modules.get(module_name)
+    tool_module_name = f"{tool_name}{postfix}"
+    if existing_module is None or not hasattr(existing_module, expected_action_cls):
+        params = {}
+        if parameters:
+            for k, v in parameters['properties'].items():
+                params[k] = ParamInfo(name=k,
+                                      type=v.get('type', 'string'),
+                                      required=False if v.get('default') else True,
+                                      default_value=v.get('default'),
+                                      desc=v.get('description', k))
+
+        # ToolAction process
+        with open(tool_py_path, 'w') as write:
+            write.writelines(TOOL_ACTION.format(name=tool_name,
+                                                action_name_upper=action_name.upper(),
+                                                action_name=action_name,
+                                                desc=desc if desc else action_name,
+                                                params=params))
+    else:
+        logger.info(f"{module_name} already provides {expected_action_cls}, reuse the tool action.")
+
+    # build tool
+    if tool_name not in ToolFactory:
+        con = TOOL_TEMPLATE.format(name=tool_name,
+                                   desc_literal=repr(tool_desc if tool_desc else tool_name),
+                                   action=f"{tool_name}Action",
+                                   cls='AsyncTool' if is_async else 'Tool',
+                                   async_flag='async ' if is_async else '',
+                                   async_underline='async_' if is_async else '',
+                                   await_flag='await ' if is_async else '')
+
+        with open(tool_py_path, 'a+') as write:
+            write.writelines(con)
+        _load_module_from_path(tool_module_name, tool_py_path)
+
+        # write to AWorld environ variables,
+        val = os.environ.get(LOCAL_TOOLS_ENV_VAR, "")
+        kept_entries, _ = prune_missing_local_tool_entries(val)
+        val = encode_local_tool_entries(kept_entries)
+        if val:
+            val = val + ";"
+        os.environ[LOCAL_TOOLS_ENV_VAR] = val + encode_local_tool_entry(
+            sys.modules[action_module_name].__file__,
+            sys.modules[tool_module_name].__file__,
+        )
+        logger.debug(f'add {sys.modules[action_module_name].__file__}')
+
+
+def func_params(func: Callable[..., Any]):
+    """Extracts parameter information from the function.
+
+    Args:
+        func: An executable function.
+
+    Returns:
+        JSON schema of the function input parameters.
+    """
+    sig = inspect.signature(func)
+    type_hints = get_type_hints(func)
+    filtered_params = []
+
+    # The function must have a return value
+    if sig.return_annotation == inspect.Parameter.empty:
+        raise RuntimeError(f"{func} no return value, preferably a string.")
+
+    for name, param in sig.parameters.items():
+        filtered_params.append((name, param))
+
+    fields: dict[str, Any] = {}
+    param_descs = {}
+
+    for name, param in filtered_params:
+        ann = type_hints.get(name, param.annotation)
+        default = param.default
+        def_desc = None
+        if hasattr(default, 'description'):
+            def_desc = default.description
+        field_description = param_descs.get(name, def_desc)
+        
+        if isinstance(default, FieldInfo):
+            default = default.default
+
+        # If there's no type hint, assume `Any`
+        if ann == inspect.Parameter.empty:
+            ann = Any
+
+        # Handle different parameter kinds
+        if param.kind == param.VAR_POSITIONAL:
+            # e.g. *args: extend positional args
+            if get_origin(ann) is tuple:
+                # e.g. def foo(*args: tuple[int, ...]) -> treat as List[int]
+                args_of_tuple = get_args(ann)
+                if len(args_of_tuple) == 2 and args_of_tuple[1] is Ellipsis:
+                    ann = list[args_of_tuple[0]]  # type: ignore
+                else:
+                    ann = list[Any]
+            else:
+                # If user wrote *args: int, treat as List[int]
+                ann = list[ann]  # type: ignore
+
+            # Default factory to empty list
+            fields[name] = (
+                ann,
+                Field(default_factory=list, description=field_description),  # type: ignore
+            )
+        elif param.kind == param.VAR_KEYWORD:
+            # **kwargs handling
+            if get_origin(ann) is dict:
+                # e.g. def foo(**kwargs: dict[str, int])
+                dict_args = get_args(ann)
+                if len(dict_args) == 2:
+                    ann = dict[dict_args[0], dict_args[1]]  # type: ignore
+                else:
+                    ann = dict[str, Any]
+            else:
+                # e.g. def foo(**kwargs: int) -> Dict[str, int]
+                ann = dict[str, ann]
+
+            fields[name] = (
+                ann,
+                Field(default_factory=dict, description=field_description),  # type: ignore
+            )
+        else:
+            if default == inspect.Parameter.empty:
+                # Required field
+                fields[name] = (ann, Field(..., description=field_description))
+            else:
+                # Parameter with a default value
+                fields[name] = (ann, Field(default=default, description=field_description))
+
+    dynamic_model = create_model(f"{func.__name__}".upper(), __base__=BaseModel, **fields)
+    json_schema = dynamic_model.model_json_schema()
+    logger.debug(f"{func} parameters schema: {json_schema}")
+    return json_schema

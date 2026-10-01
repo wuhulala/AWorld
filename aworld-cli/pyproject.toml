@@ -19,4 +19,5 @@ skills = ["aworld[skills]==1.0.0a1"]
 aworld-cli = "aworld_cli.entrypoint:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/aworld_cli"]
+only-include = ["src/aworld_cli/__init__.py", "src/aworld_cli/__main__.py", "src/aworld_cli/entrypoint.py"]
+sources = ["src"]

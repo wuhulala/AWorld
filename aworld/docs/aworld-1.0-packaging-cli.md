@@ -19,3 +19,5 @@ The CLI uses the same direct Agent loop as applications. Session history persist
 The Micron integration test used the local search-api Skill and a real model. It searched the release, read the complete official press-release syndication after IR returned HTTP 403, and produced a report. Runtime integration is tested separately with a pinned aworld wheel, native ATIF and SkillsBench verifier output.
 
 `build_packages.py` builds both projects in one invocation, checks that CLI and core versions and dependencies agree, and writes `packages.json` with wheel/sdist SHA256 values. The Runtime bundle installs the two wheels together.
+
+Historical code, CLI, resources and tests are retained in the repository. Wheels select explicit new entry files, so restoring historical source does not reintroduce old imports or dependencies into the default Runtime. Historical source remains in sdists for review; cleanup will happen gradually after the new version stabilizes.

@@ -1,0 +1,348 @@
+from types import SimpleNamespace
+
+import pytest
+
+from aworld.core.context.amni import ApplicationContext
+from aworld.core.context.amni.prompt.assembly import (
+    CacheAwarePromptAssemblyProvider,
+    DefaultPromptAssemblyProvider,
+    PromptAssemblyPlan,
+)
+from aworld.core.context.amni.config import AgentContextConfig
+from aworld.core.context.amni.prompt.neurons import Neuron
+from aworld.core.context.amni.processor.op.system_prompt_augment_op import SystemPromptAugmentOp
+from aworld.core.context.compiler import (
+    ContextObservationSidecar,
+    adapt_final_messages,
+    thaw_json,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("knowledge,planning", [(True, False), (False, True)])
+async def test_knowledge_and_planning_prompt_features_follow_their_own_switches(monkeypatch, knowledge, planning):
+    captured = []
+    config = AgentContextConfig(
+        enable_system_prompt_augment=True, enable_aworld_file=False, neuron_names=[],
+        automated_cognitive_ingestion=knowledge, automated_reasoning_orchestrator=planning,
+    )
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.AgentFactory.agent_instance",
+        lambda agent_id: SimpleNamespace(ptc_tools=None, skill_configs=None),
+    )
+    def capture(names):
+        captured.extend(names)
+        return []
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.neuron_factory.get_neurons_by_names", capture,
+    )
+    await SystemPromptAugmentOp()._process_neurons(
+        SimpleNamespace(session_id="session", get_agent_context_config=lambda agent_id: config),
+        SimpleNamespace(agent_id="agent", namespace=None),
+    )
+    assert ("action_info" in captured) is knowledge
+    assert ("todo" in captured) is planning
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_augment_op_enables_relevant_memory_neuron_with_aworld_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aworld.core.context.amni.prompt.neurons.aworld_file_neuron import AWORLD_FILE_NEURON_NAME
+    from aworld.core.context.amni.prompt.neurons.relevant_memory_neuron import (
+        RELEVANT_MEMORY_NEURON_NAME,
+    )
+
+    captured = {}
+
+    class FakeContext:
+        session_id = "session-1"
+
+        def get_agent_context_config(self, namespace):
+            return AgentContextConfig(
+                enable_aworld_file=True,
+                enable_system_prompt_augment=True,
+                neuron_names=[],
+            )
+
+    def fake_get_neurons_by_names(names):
+        captured["names"] = list(names)
+        return []
+
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.AgentFactory.agent_instance",
+        lambda agent_id: SimpleNamespace(ptc_tools=None, skill_configs=None),
+    )
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.neuron_factory.get_neurons_by_names",
+        fake_get_neurons_by_names,
+    )
+
+    op = SystemPromptAugmentOp()
+    result = await op._process_neurons(
+        FakeContext(),
+        SimpleNamespace(agent_id="agent-1", namespace=None),
+    )
+
+    assert result == {}
+    assert AWORLD_FILE_NEURON_NAME in captured["names"]
+    assert RELEVANT_MEMORY_NEURON_NAME in captured["names"]
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_augment_emits_exact_pre_fold_neuron_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published = []
+
+    class FirstNeuron(Neuron):
+        name = "first"
+
+        async def desc(self, context, namespace=None, **kwargs):
+            return "first-desc"
+
+    class SecondNeuron(Neuron):
+        name = "second"
+
+        async def desc(self, context, namespace=None, **kwargs):
+            return "second-desc"
+
+    first = FirstNeuron()
+    second = SecondNeuron()
+
+    class FakeContext:
+        session_id = "session-1"
+        task_id = "task-1"
+        task_input = "query"
+
+        def get_agent_context_config(self, namespace):
+            return AgentContextConfig(
+                enable_system_prompt_augment=True,
+                neuron_names=["first", "second"],
+            )
+
+        def publish_context_observation(self, sidecar):
+            published.append(sidecar)
+
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.AgentFactory.agent_instance",
+        lambda agent_id: SimpleNamespace(ptc_tools=None, skill_configs=None),
+    )
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.neuron_factory.get_neurons_by_names",
+        lambda names: [first, second],
+    )
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.neuron_factory._prio",
+        {"first": 20, "second": 10},
+    )
+
+    async def fake_rerank(*, neuron, context, namespace):
+        return "same-output"
+
+    op = SystemPromptAugmentOp()
+    monkeypatch.setattr(op, "rerank_items", fake_rerank)
+
+    result = await op._process_neurons(
+        FakeContext(),
+        SimpleNamespace(agent_id="agent-1", namespace="agent-1"),
+    )
+
+    assert result == {
+        "second": "second-desc\n\nsame-output",
+        "first": "first-desc\n\nsame-output",
+    }
+    assert len(published) == 1
+    sidecar = published[0]
+    assert sidecar.owner == "amni.neuron_outputs"
+    assert sidecar.namespace == "agent-1"
+    assert [item.occurrence for item in sidecar.result.items] == [0, 1]
+    assert [item.payload["neuron"]["name"] for item in sidecar.result.items] == [
+        "first",
+        "second",
+    ]
+    assert [thaw_json(item.payload)["output"] for item in sidecar.result.items] == [
+        "first-desc\n\nsame-output",
+        "second-desc\n\nsame-output",
+    ]
+
+    def fail_observation(*args, **kwargs):
+        raise RuntimeError("observation-secret")
+
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.adapt_neuron_outputs",
+        fail_observation,
+    )
+    assert await op._process_neurons(
+        FakeContext(),
+        SimpleNamespace(agent_id="agent-1", namespace="agent-1"),
+    ) == result
+    assert len(published) == 1
+
+
+def test_application_context_resolves_default_and_agent_prompt_assembly_provider() -> None:
+    context = ApplicationContext.create(
+        session_id="session-1",
+        task_id="task-1",
+        task_content="hello",
+    )
+
+    default_provider = context.get_prompt_assembly_provider()
+    assert isinstance(default_provider, DefaultPromptAssemblyProvider)
+    assert context.get_prompt_assembly_provider() is default_provider
+
+    custom_provider = object()
+    agent = SimpleNamespace(prompt_assembly_provider=custom_provider)
+    assert context.get_prompt_assembly_provider(agent=agent) is custom_provider
+
+    cache_aware_provider = context.get_prompt_assembly_provider(
+        agent=SimpleNamespace(prompt_assembly_provider=None, _is_context_cache_enabled=lambda _context: True)
+    )
+    assert isinstance(cache_aware_provider, CacheAwarePromptAssemblyProvider)
+
+
+def test_application_context_deep_copy_preserves_prompt_assembly_provider_runtime_slots() -> None:
+    context = ApplicationContext.create(
+        session_id="session-1",
+        task_id="task-1",
+        task_content="hello",
+    )
+    copied = context.deep_copy()
+
+    provider = copied.get_prompt_assembly_provider(
+        agent=SimpleNamespace(prompt_assembly_provider=None, _is_context_cache_enabled=lambda _context: True)
+    )
+
+    assert isinstance(provider, CacheAwarePromptAssemblyProvider)
+    assert copied.get_prompt_assembly_provider(
+        agent=SimpleNamespace(prompt_assembly_provider=None, _is_context_cache_enabled=lambda _context: True)
+    ) is provider
+
+
+def test_application_context_task_transition_fences_request_observations() -> None:
+    context = ApplicationContext.create(
+        session_id="session-1",
+        task_id="task-1",
+        task_content="hello",
+    )
+    context.publish_context_observation(
+        ContextObservationSidecar.from_adapter_result(
+            owner="test.owner",
+            namespace="agent-1",
+            source_identity="owner://task-1",
+            result=adapt_final_messages(
+                [{"role": "system", "content": "private output"}],
+                source_identity="owner://task-1",
+            ),
+        )
+    )
+
+    context.task_id = "task-1"
+    assert context.get_context_observations()
+
+    context.task_id = "task-2"
+    assert context.get_context_observations() == ()
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_augment_op_uses_injected_prompt_assembly_provider() -> None:
+    captured = {}
+
+    class CustomPromptAssemblyProvider:
+        def build_plan(self, *, messages, tools=None, metadata=None):
+            captured["messages"] = list(messages)
+            captured["metadata"] = dict(metadata or {})
+            return PromptAssemblyPlan(
+                messages=[
+                    {"role": "system", "content": "assembled rules"},
+                    {"role": "system", "content": "assembled memory"},
+                ],
+                stable_hash="stable-hash-1",
+                observability={"assembly_provider": "CustomPromptAssemblyProvider"},
+                metadata=dict(metadata or {}),
+            )
+
+    class FakeContext:
+        def get_prompt_assembly_provider(self, agent=None):
+            return CustomPromptAssemblyProvider()
+
+        def get_task(self):
+            return SimpleNamespace(session_id="session-1", id="task-1", user_id="user-1")
+
+    op = SystemPromptAugmentOp()
+    command = await op.build_system_command(
+        FakeContext(),
+        SimpleNamespace(agent_id="agent-1", agent_name="Agent One", user_query="hello", system_prompt="base rules"),
+        {"memory": "memory chunk"},
+    )
+
+    assert captured["messages"] == [
+        {"role": "system", "content": "base rules"},
+        {"role": "system", "content": "memory chunk"},
+    ]
+    assert command.item.content == "assembled rules\n\nassembled memory"
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_augment_persists_ordered_stable_dynamic_sections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published = []
+
+    class IdentityTemplate:
+        def __init__(self, template):
+            self.template = template
+
+        async def async_format(self, **kwargs):
+            return self.template
+
+    class FakeContext:
+        task_id = "task-1"
+        task_epoch = 2
+
+        def get_prompt_assembly_provider(self, agent=None):
+            return CacheAwarePromptAssemblyProvider()
+
+        def get_task(self):
+            return SimpleNamespace(
+                session_id="session-1", id="task-1", user_id="user-1"
+            )
+
+        def publish_context_observation(self, sidecar):
+            published.append(sidecar)
+
+    monkeypatch.setattr(
+        "aworld.core.context.amni.processor.op.system_prompt_augment_op.ContextPromptTemplate",
+        IdentityTemplate,
+    )
+    command = await SystemPromptAugmentOp().build_system_command(
+        FakeContext(),
+        SimpleNamespace(
+            agent_id="agent-1",
+            agent_name="Agent One",
+            user_query="hello",
+            system_prompt="stable rules",
+        ),
+        {"relevant_memory": "dynamic memory"},
+    )
+
+    assert command.item.content == "stable rules\n\ndynamic memory"
+    sections = command.item.metadata["ext_info"][
+        "aworld_context_system_sections"
+    ]["sections"]
+    assert [(item["stability"], item["content"]) for item in sections] == [
+        ("stable", "stable rules"),
+        ("dynamic", "dynamic memory"),
+    ]
+    assert [sidecar.owner for sidecar in published] == [
+        "amni.folded_system",
+        "amni.system_sections",
+    ]
+    from aworld.agents.llm_agent import Agent
+
+    assert Agent._amni_system_section_messages(command.item) == [
+        {"role": "system", "content": "stable rules"},
+        {"role": "system", "content": "dynamic memory"},
+    ]
+    command.item.content = "tampered"
+    assert Agent._amni_system_section_messages(command.item) is None
