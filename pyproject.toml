@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.27,<2", "editables>=0.5,<1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aworld"
+dynamic = ["version"]
+description = "AWorld: a minimal Session/Run agent kernel"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "Ant AI"}]
+dependencies = []
+
+[project.scripts]
+aworld = "aworld.cli.main:main"
+
+[project.optional-dependencies]
+llm = ["httpx[socks]>=0.27,<1"]
+skills = ["PyYAML>=6,<7"]
+dev = ["pytest>=8", "build>=1.2,<2", "hatchling>=1.27,<2", "editables>=0.5,<1"]
+
+[tool.hatch.version]
+path = "aworld/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aworld"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/aworld", "/aworld-cli", "/examples/core_session", "/tests", "/conftest.py", "/pytest.ini", "/pyproject.toml", "/README.md", "/README_zh.md", "/LICENSE"]
+
+[tool.hatch.build]
+exclude = ["**/__pycache__/**", "**/*.pyc", "**/.env", "**/.venv/**", "/dist/**", "/aworld-cli/dist/**", "**/.pytest_cache/**"]

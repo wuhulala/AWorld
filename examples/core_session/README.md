@@ -4,7 +4,7 @@ Run from the repository root with Python 3.10 or later. The new kernel requires
 only the standard library:
 
 ```sh
-AWORLD_DISABLE_AUTO_DOTENV=1 python examples/core_session/demo.py
+AWORLD_DISABLE_AUTO_DOTENV=1 python examples/aworld/demo.py
 ```
 
 The configured `Agent` owns one model/tool loop. `Context` owns the canonical
@@ -39,7 +39,7 @@ To persist context through the original file storage backend, Pydantic 2 is the
 only additional storage dependency:
 
 ```sh
-AWORLD_DISABLE_AUTO_DOTENV=1 python examples/core_session/demo.py --context-dir /tmp/aworld-context-demo
+AWORLD_DISABLE_AUTO_DOTENV=1 python examples/aworld/demo.py --context-dir /tmp/aworld-context-demo
 ```
 
 Storage is an internal option of Context. The bridge reuses the original backend
@@ -105,7 +105,7 @@ PyYAML, never installs packages or runs scripts. The default core remains stdlib
 Run actual files, bash and cross-session queries with a deterministic local model:
 
 ```sh
-AWORLD_DISABLE_AUTO_DOTENV=1 python examples/core_session/tools_demo.py
+AWORLD_DISABLE_AUTO_DOTENV=1 python examples/aworld/tools_demo.py
 ```
 
 Subagents use ordinary tools:

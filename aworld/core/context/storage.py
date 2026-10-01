@@ -26,25 +26,24 @@ class MemoryStoreAdapter:
     values; live runs and event subscriptions remain owned by Session.
     """
 
-    def __init__(self, memory_store) -> None:
+    def __init__(self, memory_store, *, item_factory) -> None:
         self._store = memory_store
+        self._item_factory = item_factory
 
     def append(self, session_id: str, entry: SessionEntry) -> None:
-        from aworld.memory.models import MemoryItem
-
         content = json.dumps(
             {"run_id": entry.run_id, "kind": entry.kind, "data": entry.data},
             ensure_ascii=False, allow_nan=False,
         )
-        self._store.add(MemoryItem(
-            content=content, memory_type="session_entry",
-            metadata={"session_id": session_id, "aworld_core_history": "1"},
+        self._store.add(self._item_factory(
+            content=content, memory_type="message",
+            metadata={"session_id": session_id, "aworld_history": "1"},
         ))
 
     def read(self, session_id: str) -> tuple[SessionEntry, ...]:
         entries = []
-        for item in self._store.get_all(filters={"session_id": session_id, "memory_type": "session_entry"}):
-            if item.metadata.get("aworld_core_history") != "1":
+        for item in self._store.get_all(filters={"session_id": session_id, "memory_type": "message"}):
+            if item.metadata.get("aworld_history") != "1":
                 continue
             data = json.loads(item.content)
             entries.append(SessionEntry(data["run_id"], data["kind"], data["data"]))
