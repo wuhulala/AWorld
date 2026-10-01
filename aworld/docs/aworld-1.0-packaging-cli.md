@@ -5,7 +5,7 @@ The root `aworld` wheel includes the Session/Run kernel, Agent, Context, Tools, 
 Hatchling reads a literal version from `aworld/_version.py`. Builds neither import business modules nor invoke pip; default dependencies are empty. Install `.[llm,skills]` to use the HTTPX Chat Completions adapter and discover YAML Skill metadata. `aworld-cli` is an optional delegating wrapper depending on this same root wheel.
 
 ```bash
-python -m build
+python scripts/build_packages.py
 python -m pip install '.[llm,skills]'
 aworld run --demo --task hello --follow-up again --json
 aworld run --model MODEL --base-url URL --task 'Read the latest earnings' \
@@ -17,3 +17,5 @@ Pass keys via AWORLD_API_KEY / OPENAI_API_KEY. `--events` writes observation eve
 The CLI uses the same direct Agent loop as applications. Session history persists for follow-up Runs in this process. Interactive commands `/new`, `/sessions`, `/session ID`, `/query JSON` and `/read ID` operate on the current in-process store. Cross-process persistence and automatic compaction remain future work.
 
 The Micron integration test used the local search-api Skill and a real model. It searched the release, read the complete official press-release syndication after IR returned HTTP 403, and produced a report. Runtime integration is tested separately with a pinned aworld wheel, native ATIF and SkillsBench verifier output.
+
+`build_packages.py` builds both projects in one invocation, checks that CLI and core versions and dependencies agree, and writes `packages.json` with wheel/sdist SHA256 values. The Runtime bundle installs the two wheels together.

@@ -21,8 +21,8 @@ def run(*args, cwd=None):
 def artifacts(tmp_path_factory):
     work = tmp_path_factory.mktemp("distribution")
     output = work / "artifacts"
-    for source in (ROOT, ROOT / "aworld-cli"):
-        run(sys.executable, "-m", "build", "--no-isolation", "--outdir", str(output), str(source))
+    run(sys.executable, str(ROOT / "scripts/build_packages.py"), "--no-isolation", "--outdir", str(output))
+    assert json.loads((output / "packages.json").read_text())["version"] == "1.0.0a1"
     return work, output
 
 

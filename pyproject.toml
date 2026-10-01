@@ -27,7 +27,7 @@ path = "aworld/_version.py"
 packages = ["aworld"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/aworld", "/aworld-cli", "/examples/core_session", "/tests", "/conftest.py", "/pytest.ini", "/pyproject.toml", "/README.md", "/README_zh.md", "/LICENSE"]
+include = ["/aworld", "/aworld-cli", "/examples/core_session", "/tests", "/conftest.py", "/pytest.ini", "/scripts/build_packages.py", "/pyproject.toml", "/README.md", "/README_zh.md", "/LICENSE"]
 
 [tool.hatch.build]
 exclude = ["**/__pycache__/**", "**/*.pyc", "**/.env", "**/.venv/**", "/dist/**", "/aworld-cli/dist/**", "**/.pytest_cache/**"]
