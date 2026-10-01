@@ -1,33 +1,3 @@
-# AWorld 1.0
-
-A minimal Python agent kernel: **Agent + Context + Tool**, with Session/Run as the application entry.
-
-```bash
-python -m pip install '.[llm,skills]'
-aworld run --demo --task hello
-aworld run --model MODEL --base-url URL --task 'Your task' --skill-path ~/.agents/skills
-```
-
-Credentials come from `AWORLD_API_KEY` or `OPENAI_API_KEY`; they are never CLI arguments. The core package has no mandatory third-party dependencies. `llm` adds HTTPX, and `skills` adds YAML parsing.
-
-`aworld` is the single Python namespace and distribution, containing the kernel and CLI. The optional `aworld-cli` distribution is only a thin wrapper around that CLI. `aworldv1` identifies the new **Lingguang Bench Runtime Harness**, selected with `--harness aworldv1`; it is not a Python package.
-
-Each Session owns its context history; each submitted Run drives a direct model/tool loop. LocalSandbox provides local filesystem and process execution. Defaults include read, write, bash, read_session, search_sessions and session_query. Subagents are implemented as tools with child Session/Run lifecycles. Skills are discovered as metadata and read when needed.
-
-Historical framework, CLI, resources and tests remain in the source tree. The new default entry uses the minimal kernel; historical source is excluded from its wheel and is not loaded by default. History uses a small storage interface; optional MemoryStoreAdapter accepts an explicit store and item factory.
-
-Build with `python -m build`; packaging is declared in `pyproject.toml` using Hatchling. The default build does not execute the retained legacy setup.py or hatch_build.py scripts.
-
-The first version uses in-process Sessions and full context history. It does not yet provide cross-process session persistence, token-budget compaction, streaming or provider retry policies.
-
-[Session/Run contract](aworld/docs/aworld-1.0-session-run-contract.md) · [CLI and packaging](aworld/docs/aworld-1.0-packaging-cli.md)
-
----
-
-## Historical documentation / 历史说明（源码保留，迁移待稳定后分步进行）
-
-以下是之前版本的原始说明；新版构建与入口以本文开头和新版打包文档为准。
-
 <div align="center">
 
 # AWorld: The Agent Harness for Your World
@@ -64,7 +34,7 @@ The first version uses in-process Sessions and full context history. It does not
 <p align="justify">
 General AI often hits a "wall of context"—the nuanced data, workflows, and intuition that define <em>your</em> world. An agent's true power lies not in the model alone, but in its <b>Agent Harness</b>: the framework orchestrating its tools, memory, context, and execution.
 
-This is the <b>AWorld Thesis</b>: A powerful harness is not enough. True AI scaling is unlocked only when experts like you embed the invaluable knowledge, effectively building the gate in that wall.
+This is the <b>AWorld Thesis</b>: A powerful harness is not enough. True AI scaling is unlocked only when experts like you embed the invaluable knowledge, effectively building the gate in that wall. 
 
 AWorld is the platform designed for this singular purpose. We provide a complete, battle-tested Harness as the recipe for you, the expert, to forge your knowledge into a fleet of autonomous agents. Together, we move beyond AI's generic promise to create robust, precise applications that master <em>your</em> specific domain.
 </p>
@@ -106,7 +76,7 @@ This is what's possible today. Imagine what we'll build with *your* expertise.
   <td style="width:22%"><img src="readme_assets/aworld_cli_intro_ds.gif" alt="Deep search demo" width="270"></td>
   <td><a href="docs/AWorld CLI/Recipes/Deep Search.md">View Recipe</a></td>
 </tr>
-<!--
+<!-- 
 <tr>
   <td>Create Video: Self-Intro</td>
   <td>• Auto-creation by <a href="https://www.skillhub.club/skills/remotion-dev-remotion-remotion">Remotion Skill</a><br>• Human evaluation</td>
@@ -172,7 +142,7 @@ Install once, configure globally, and run anywhere.
 ```bash
 git clone https://github.com/inclusionAI/AWorld && cd AWorld
 
-conda create -n aworld_env python=3.11 -y && conda activate aworld_env
+conda create -n aworld_env python=3.11 -y && conda activate aworld_env 
 
 pip install -e . && cd aworld-cli && pip install -e .
 ```
@@ -227,8 +197,8 @@ Imagine you ask: *"Help me create an English word learning mini-app with a UI qu
 ***📹  See the Self-Evolution Loop in Action***
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/ff56195e-e117-4d33-b709-9a2144680abd"
-         poster="readme_assets/evolution_loop_poster.png"
+  <video src="https://github.com/user-attachments/assets/ff56195e-e117-4d33-b709-9a2144680abd" 
+         poster="readme_assets/evolution_loop_poster.png" 
          width="80%" controls style="max-width: 80%;">
   </video>
 </p>
@@ -407,7 +377,7 @@ The following top rankings on competitive benchmarks are more than just agent ac
 1. **FunReason-MT Technical Report: Overcoming the Complexity Barrier in Multi-Turn Function Calling** arxiv, 2025. [paper](https://arxiv.org/abs/2510.24645), [code](https://github.com/inclusionAI/AWorld-RL), [model](https://huggingface.co/Bingguang/FunReason-MT), [dataset](https://huggingface.co/datasets/Bingguang/FunReason-MT)
 
     *Zengzhuang Xu, Bingguang Hao, Zechuan Wang, Yuntao Wen, Maolin Wang, etc.*
-
+   
 2. **From Failure to Mastery: Generating Hard Samples for Tool-use Agents** arxiv, 2026. [paper](https://arxiv.org/abs/2601.01498), [code](https://github.com/inclusionAI/AWorld-RL), [model](https://huggingface.co/Bingguang/FunReason-MT), [dataset](https://huggingface.co/datasets/Bingguang/FunReason-MT)
 
     *Bingguang Hao, Zengzhuang Xu, Yuntao Wen, Xinyi Xu, Yang Liu, etc.*
@@ -524,13 +494,13 @@ For academic citations or wish to contact us, please use the following BibTeX en
 
 ```bibtex
 @misc{yu2025aworldorchestratingtrainingrecipe,
-      title={AWorld: Orchestrating the Training Recipe for Agentic AI},
+      title={AWorld: Orchestrating the Training Recipe for Agentic AI}, 
       author={Chengyue Yu and Siyuan Lu and Chenyi Zhuang and Dong Wang and Qintong Wu and Zongyue Li and Runsheng Gan and Chunfeng Wang and Siqi Hou and Gaochi Huang and Wenlong Yan and Lifeng Hong and Aohui Xue and Yanfeng Wang and Jinjie Gu and David Tsai and Tao Lin},
       year={2025},
       eprint={2508.20404},
       archivePrefix={arXiv},
       primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2508.20404},
+      url={https://arxiv.org/abs/2508.20404}, 
 }
 ```
 

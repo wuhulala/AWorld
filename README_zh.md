@@ -1,29 +1,3 @@
-# AWorld 1.0
-
-新架构只保留 Agent、Context、Tool，以 Session / Run 提交和管理任务。
-源码命名空间、wheel 和命令均为 `aworld`；`aworldv1` 仅为 Lingguang Bench Runtime 内的新 Harness 标识。
-
-```bash
-python -m pip install '.[llm,skills]'
-aworld run --demo --task hello
-aworld run --model MODEL --base-url URL --task '读取最新财报' --skill-path ~/.agents/skills
-python -m build
-```
-
-API Key 通过 AWORLD_API_KEY / OPENAI_API_KEY 传入。默认 LocalSandbox 提供本地文件和进程，默认工具包含 read、write、bash 以及会话读取、搜索、查询。
-
-旧框架、旧 CLI、资源和测试保留在源码中。新版默认入口单独打包，默认不加载旧模块。默认无第三方依赖，模型连接、Skill 解析分别通过 llm、skills extras 选择；没有构建期间导入业务代码或自动安装依赖。
-
-当前 Session 在进程内保存，Context 使用完整历史，暂未提供跨进程会话持久化、按 token 压缩、流式响应及模型重试策略。
-
-详见 [接口契约](aworld/docs/aworld-1.0-session-run-contract.md) 和 [打包与 CLI](aworld/docs/aworld-1.0-packaging-cli.md)。
-
----
-
-## Historical documentation / 历史说明（源码保留，迁移待稳定后分步进行）
-
-以下是之前版本的原始说明；新版构建与入口以本文开头和新版打包文档为准。
-
 <div align="center">
 
 # AWorld：为你的世界打造的智能体驾驭框架
@@ -108,7 +82,7 @@ Python 代码导入名保持 **`aworld_gateway`**，因为 Python 的包导入�
   <td style="width:22%"><img src="readme_assets/aworld_cli_intro_ds.gif" alt="Deep search demo" width="270"></td>
   <td><a href="docs/AWorld CLI/Recipes/Deep Search.md">查看配方</a></td>
 </tr>
-<!--
+<!-- 
 <tr>
   <td>创建视频：自我介绍</td>
   <td>• 由 <a href="https://www.skillhub.club/skills/remotion-dev-remotion-remotion">Remotion Skill</a> 自动创建<br>• 人工评估</td>
@@ -174,7 +148,7 @@ Python 代码导入名保持 **`aworld_gateway`**，因为 Python 的包导入�
 ```bash
 git clone https://github.com/inclusionAI/AWorld && cd AWorld
 
-conda create -n aworld_env python=3.11 -y && conda activate aworld_env
+conda create -n aworld_env python=3.11 -y && conda activate aworld_env 
 
 pip install -e . && cd aworld-cli && pip install -e .
 ```
@@ -225,8 +199,8 @@ AWorld-CLI 不只是脚手架工具。它像一个中枢大脑（AWorld Agent）
 ***📹 观看自演进循环实战***
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/ff56195e-e117-4d33-b709-9a2144680abd"
-         poster="readme_assets/evolution_loop_poster.png"
+  <video src="https://github.com/user-attachments/assets/ff56195e-e117-4d33-b709-9a2144680abd" 
+         poster="readme_assets/evolution_loop_poster.png" 
          width="80%" controls style="max-width: 80%;">
   </video>
 </p>
@@ -405,7 +379,7 @@ CAST 提供“修改能力”，而你的知识提供“方向”。AWorld 的 <
 1. **FunReason-MT Technical Report: Overcoming the Complexity Barrier in Multi-Turn Function Calling** arxiv, 2025. [paper](https://arxiv.org/abs/2510.24645), [code](https://github.com/inclusionAI/AWorld-RL), [model](https://huggingface.co/Bingguang/FunReason-MT), [dataset](https://huggingface.co/datasets/Bingguang/FunReason-MT)
 
     *Zengzhuang Xu, Bingguang Hao, Zechuan Wang, Yuntao Wen, Maolin Wang, etc.*
-
+   
 2. **From Failure to Mastery: Generating Hard Samples for Tool-use Agents** arxiv, 2026. [paper](https://arxiv.org/abs/2601.01498), [code](https://github.com/inclusionAI/AWorld-RL), [model](https://huggingface.co/Bingguang/FunReason-MT), [dataset](https://huggingface.co/datasets/Bingguang/FunReason-MT)
 
     *Bingguang Hao, Zengzhuang Xu, Yuntao Wen, Xinyi Xu, Yang Liu, etc.*
@@ -520,13 +494,13 @@ result = info['result']
 
 ```bibtex
 @misc{yu2025aworldorchestratingtrainingrecipe,
-      title={AWorld: Orchestrating the Training Recipe for Agentic AI},
+      title={AWorld: Orchestrating the Training Recipe for Agentic AI}, 
       author={Chengyue Yu and Siyuan Lu and Chenyi Zhuang and Dong Wang and Qintong Wu and Zongyue Li and Runsheng Gan and Chunfeng Wang and Siqi Hou and Gaochi Huang and Wenlong Yan and Lifeng Hong and Aohui Xue and Yanfeng Wang and Jinjie Gu and David Tsai and Tao Lin},
       year={2025},
       eprint={2508.20404},
       archivePrefix={arXiv},
       primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2508.20404},
+      url={https://arxiv.org/abs/2508.20404}, 
 }
 ```
 
