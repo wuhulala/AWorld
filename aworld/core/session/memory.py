@@ -185,6 +185,12 @@ class _ExecutionContext:
         self._check()
         return view
 
+    async def prepare_request(self, request, *, model):
+        self._check()
+        value = await self._run._session.context.prepare_request(request, model=model, execution=self)
+        self._check()
+        return value
+
     def append(self, kind: str, data: object) -> None:
         self._check()
         if not isinstance(kind, str) or not kind.strip() or kind in ("input", "output"):

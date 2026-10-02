@@ -116,6 +116,18 @@ class Context:
             raise TypeError("Context policy must return ContextEntry values")
         return deepcopy(view)
 
+    async def prepare_request(self, request, *, model, execution):
+        """Apply optional model-aware preparation through the fenced Run view."""
+        from aworld.core.agent.messages import ModelRequest
+        prepare = getattr(self._policy, "prepare_request", None)
+        if prepare is None:
+            return deepcopy(request)
+        value = await prepare(deepcopy(request), history=self.history(), model=model, execution=execution,
+                              read_history=self.history)
+        if not isinstance(value, ModelRequest):
+            raise TypeError("Context policy must return a ModelRequest")
+        return deepcopy(value)
+
     def _append(self, entry: ContextEntry) -> None:
         self._check_loop()
         self._storage.append(self.id, deepcopy(entry))

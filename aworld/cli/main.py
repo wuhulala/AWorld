@@ -18,7 +18,7 @@ from uuid import uuid4
 from aworld._version import __version__
 from aworld.core.agent import Agent
 from aworld.core.agent.messages import AssistantMessage, ToolCall, ToolResultMessage
-from aworld.core.context import Context
+from aworld.core.context import BudgetPolicy, Context, ContextBudget
 from aworld.core.sandbox import LocalSandbox
 from aworld.core.session import InMemorySessionStore, RunOptions, RunStatus, create_session, load_session
 from aworld.core.tool import ToolRegistry, default_tools, session_tools
@@ -82,8 +82,9 @@ def parser():
     value.add_argument("--task", help="Task text (alternative to positional prompt)")
     value.add_argument("--follow-up", action="append", default=[], help="Another run in the same session")
     value.add_argument("--demo", action="store_true", help="Offline deterministic smoke model")
-    value.add_argument("--model", default=os.getenv("AWORLD_MODEL") or os.getenv("OPENAI_MODEL"))
-    value.add_argument("--base-url", default=os.getenv("AWORLD_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1")
+    value.add_argument("--model")
+    value.add_argument("--model-profile", help="Named model in project/user .aworld/aworld.json")
+    value.add_argument("--base-url")
     value.add_argument("--cwd", type=Path, default=Path.cwd(), help="LocalSandbox working directory")
     value.add_argument("--tools", help="Comma-separated capability names; replaces defaults")
     value.add_argument("--no-tools", action="store_true")
@@ -98,6 +99,14 @@ def parser():
     value.add_argument("--request-timeout", type=float, default=60)
     value.add_argument("--max-retries", type=int, default=3, help="Retries per unresolved model request (0-10)")
     value.add_argument("--reasoning-effort", choices=["none", "minimal", "low", "medium", "high", "xhigh"])
+    value.add_argument("--context-window", type=int, help="Override profile/environment/model-registry context limit")
+    value.add_argument("--max-output-tokens", type=int, help="Override profile output reserve and per-request cap")
+    value.add_argument("--compaction-trigger-ratio", type=float, default=0.85,
+                       help="Compact above this fraction of the remaining input budget")
+    value.add_argument("--keep-recent-tokens", type=int, help="Estimated recent history retained during compaction")
+    value.add_argument("--summary-max-tokens", type=int)
+    value.add_argument("--compaction-timeout", type=float, default=30, help="Summary request timeout in seconds")
+    value.add_argument("--no-compaction", action="store_true", help="Use the full history without automatic budgeting")
     value.add_argument("--json", action="store_true", help="Write one terminal RunResult JSON per line")
     value.add_argument("--events", action="store_true", help="Write observed Run events as JSON lines to stderr")
     value.add_argument("--trajectory-output", type=Path, help="Atomically export canonical session history as ATIF-v1.7 after each run")
@@ -144,24 +153,45 @@ async def _host(args, command):
     if command == "tools":
         print(_json(registry.schemas()) if args.json else "\n".join(f"{tool.name}: {tool.description}" for tool in registry))
         return 0
+    from aworld.cli.model_config import resolve_model_settings
+    settings = resolve_model_settings(args)
+    args.model, args.base_url = settings.model, settings.base_url
+    args.context_window, args.max_output_tokens = settings.context_window, settings.max_output_tokens
+    safety_margin = min(2048, max(64, settings.context_window // 64))
+    input_budget = settings.context_window - settings.max_output_tokens - safety_margin
+    policy = None
+    if not args.no_compaction:
+        policy = BudgetPolicy(ContextBudget(context_window=settings.context_window, output_reserve=settings.max_output_tokens,
+            safety_margin=safety_margin, trigger_ratio=args.compaction_trigger_ratio,
+            keep_recent_tokens=args.keep_recent_tokens if args.keep_recent_tokens is not None else min(16000, max(1, input_budget // 4)),
+            summary_max_tokens=args.summary_max_tokens if args.summary_max_tokens is not None else min(2048, settings.max_output_tokens, max(1, input_budget // 16)),
+            summary_timeout=args.compaction_timeout))
     from aworld.cli.prompt import BASE_PROMPT, PROMPT_VERSION, discover_skills, workspace_prompt, runtime_prompt
     skills = discover_skills(args.cwd, paths=args.skill_path, disabled=args.no_skills)
     workspace, sources = workspace_prompt(args.cwd)
     system_prompt = "\n\n".join(part for part in (BASE_PROMPT if args.system_prompt is None else args.system_prompt, workspace) if part)
     sources = [{"kind": "base", "version": PROMPT_VERSION, "custom": args.system_prompt is not None}, *sources,
                {"kind": "skills", "paths": [skill.location for skill in skills]}, {"kind": "runtime"}]
+    context_metadata = {"enabled": policy is not None, "context_window": settings.context_window,
+                        "max_output_tokens": settings.max_output_tokens, "window_source": settings.window_source,
+                        "output_source": settings.output_source, "model_profile": settings.profile}
+    if os.getenv("AWORLD_CONTEXT_BUDGET_SOURCE"):
+        context_metadata["host_source"] = os.environ["AWORLD_CONTEXT_BUDGET_SOURCE"]
+    if policy is not None:
+        context_metadata["budget"] = {item.name: getattr(policy.budget, item.name) for item in fields(policy.budget)}
     if args.demo:
         model = DemoModel()
     else:
         from aworld.models.chat_completions import ChatCompletionsModel
         model = ChatCompletionsModel(model=args.model, base_url=args.base_url,
-            api_key=os.getenv("AWORLD_API_KEY") or os.getenv("OPENAI_API_KEY"),
-            timeout=args.request_timeout, reasoning_effort=args.reasoning_effort, max_retries=args.max_retries)
+            api_key=settings.api_key, default_parameters={**settings.parameters, "max_tokens": settings.max_output_tokens},
+            timeout=args.request_timeout, max_retries=args.max_retries)
     sessions = InMemorySessionStore()
     try:
         agent = Agent(model=model, tools=registry, skills=skills, system_prompt=system_prompt, max_turns=args.max_turns,
-                      runtime_prompt=runtime_prompt(args), prompt_metadata={"version": PROMPT_VERSION, "sources": sources})
-        session = await create_session(agent=agent, context=Context(), store=sessions, metadata={"cwd": str(args.cwd.resolve())})
+                      runtime_prompt=runtime_prompt(args), prompt_metadata={"version": PROMPT_VERSION, "sources": sources,
+                                                                          "context": context_metadata})
+        session = await create_session(agent=agent, context=Context(policy=policy), store=sessions, metadata={"cwd": str(args.cwd.resolve())})
         initial = args.task if args.task is not None else args.prompt
         if initial is not None:
             code = await _execute(session, initial, args, agent)
@@ -183,7 +213,7 @@ async def _host(args, command):
                     break
                 try:
                     if line == "/new":
-                        session = await create_session(agent=agent, context=Context(), store=sessions, metadata={"cwd": str(args.cwd.resolve())})
+                        session = await create_session(agent=agent, context=Context(policy=policy), store=sessions, metadata={"cwd": str(args.cwd.resolve())})
                         print(f"Session {session.id}", file=sys.stderr)
                     elif line == "/sessions":
                         print(_json([await item.snapshot() for item in await sessions.list_sessions()]))

@@ -86,7 +86,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         session, _, result = await self.execute(Agent(model=model, tools=[add_tool(effect)]))
         self.assertEqual(result.status, RunStatus.FAILED)
         self.assertEqual(called, [])
-        self.assertEqual([entry.kind for entry in await session.history()], ["input"])
+        self.assertEqual([entry.kind for entry in await session.history()], ["input", "model.error"])
 
     async def test_turn_budget_stops_repeat_requests_without_losing_confirmed_results(self):
         model = ScriptedModel([AssistantMessage("progress", (ToolCall("call-1", "add", {"a": 2, "b": 3}),))])

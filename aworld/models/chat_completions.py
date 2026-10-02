@@ -29,6 +29,8 @@ def request_payload(request: ModelRequest, model: str, reasoning_effort: str | N
             value = {"role": "user", "content": message.content}
         messages.append(value)
     payload = {"model": model, "messages": messages, "stream": False}
+    if request.max_output_tokens is not None:
+        payload["max_tokens"] = request.max_output_tokens
     if request.tools:
         payload["tools"] = [{"type": "function", "function": {"name": tool.name,
             "description": tool.description, "parameters": dict(tool.parameters)}} for tool in request.tools]
@@ -38,6 +40,17 @@ def request_payload(request: ModelRequest, model: str, reasoning_effort: str | N
 
 
 def parse_response(payload: dict) -> AssistantMessage:
+    from aworld.core.agent.usage import ModelResponseError
+    from aworld.models.token_accounting import parse_usage
+    usage = parse_usage(payload.get("usage")) if isinstance(payload, dict) else None
+    try:
+        message = _parse_message(payload)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ModelResponseError(str(exc), usage=usage) from exc
+    return AssistantMessage(message.content, message.tool_calls, usage)
+
+
+def _parse_message(payload: dict) -> AssistantMessage:
     choices = payload.get("choices") if isinstance(payload, dict) else None
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise ValueError("Expected one complete model choice")
@@ -70,13 +83,19 @@ class ProviderModel:
     """Convert messages only; provider owns transport, parsing and retries."""
 
     def __init__(self, provider, *, model: str, reasoning_effort: str | None = None,
-                 owns_provider: bool = False):
+                 owns_provider: bool = False, default_parameters: dict | None = None):
         self._provider = provider
         self._model, self._reasoning_effort = model, reasoning_effort
         self._owns_provider = owns_provider
+        self._default_parameters = dict(default_parameters or {})
+
+    @property
+    def context_identity(self):
+        return (self._model, str(getattr(self._provider, "base_url", "")), self._reasoning_effort,
+                json.dumps(self._default_parameters, sort_keys=True))
 
     async def complete(self, request: ModelRequest) -> AssistantMessage:
-        payload = request_payload(request, self._model, self._reasoning_effort)
+        payload = {**self._default_parameters, **request_payload(request, self._model, self._reasoning_effort)}
         payload.pop("model")
         payload.pop("stream")
         messages = payload.pop("messages")
@@ -100,6 +119,10 @@ class ProviderModel:
             raw = raw.model_dump(mode="json")
         # Validate the original response: legacy normalization may fabricate
         # missing tool ids/names. Incomplete output must not dispatch tools.
+        # Use original provider evidence, never normalized missing-as-zero usage.
+        original_usage = getattr(response, "raw_usage", None)
+        if isinstance(original_usage, dict) and getattr(response, "usage_reported", True):
+            raw = {**raw, "usage": original_usage}
         return parse_response(raw)
 
     async def aclose(self):
@@ -123,7 +146,8 @@ class ChatCompletionsModel(ProviderModel):
 
     def __init__(self, *, model: str, base_url: str = "https://api.openai.com/v1",
                  api_key: str | None = None, timeout: float = 60,
-                 reasoning_effort: str | None = None, max_retries: int = 3):
+                 reasoning_effort: str | None = None, max_retries: int = 3,
+                 default_parameters: dict | None = None):
         if not isinstance(model, str) or not model.strip():
             raise ValueError("Specify --model or AWORLD_MODEL")
         parsed = urlsplit(base_url)
@@ -150,4 +174,5 @@ class ChatCompletionsModel(ProviderModel):
         provider = OpenAIProvider(model_name=model, base_url=base_url,
             api_key=api_key or "local-no-key", sync_enabled=False,
             async_enabled=True, timeout=timeout, max_retries=max_retries)
-        super().__init__(provider, model=model, reasoning_effort=reasoning_effort, owns_provider=True)
+        super().__init__(provider, model=model, reasoning_effort=reasoning_effort, owns_provider=True,
+                         default_parameters=default_parameters)

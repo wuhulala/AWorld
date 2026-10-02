@@ -84,6 +84,10 @@ class RunContext(Protocol):
         """Prepare a fresh view using the session's bound context policy."""
         ...
 
+    async def prepare_request(self, request, *, model):
+        """Apply the Context policy with the complete request envelope."""
+        ...
+
     def append(self, kind: str, data: object) -> None:
         """Confirm an executor-owned context fact without replacing history."""
         ...

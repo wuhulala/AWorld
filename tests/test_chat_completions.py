@@ -50,6 +50,67 @@ def test_message_roles_tool_ids_json_and_empty_capability_set():
     assert value["reasoning_effort"] == "none"
 
 
+def test_real_cli_profile_compaction_and_summary_usage_reach_atif(tmp_path):
+    requests, main_calls, summary_calls = [], [], []
+    (tmp_path / "note").write_text("verified file content\n" + "x" * 1900)
+    config = tmp_path / ".aworld"
+    config.mkdir()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(body)
+            if "tools" not in body:
+                summary_calls.append(body)
+                result = payload({"content": "Goal: inspect note. File content verified; continue inspection."})
+            else:
+                main_calls.append(body)
+                n = len(main_calls)
+                result = payload({"content": "verified"}) if n > 10 else payload({"tool_calls": [{
+                    "id": f"read-{n}", "type": "function", "function": {"name": "read", "arguments": '{"path":"note"}'}}]}, "tool_calls")
+            result["usage"] = {"prompt_tokens": 100, "completion_tokens": 20,
+                               "prompt_tokens_details": {"cached_tokens": 50}}
+            data = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    (config / "aworld.json").write_text(json.dumps({"models": {"fixture": {
+        "model": "local-fixture", "provider": "openai", "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+        "max_model_len": 8000, "max_tokens": 1000, "api_key_env": "FIXTURE_KEY"}}}))
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("AWORLD_", "OPENAI_", "LLM_"))}
+    environment["FIXTURE_KEY"] = "local-test-key"
+    try:
+        result = subprocess.run([sys.executable, "-m", "aworld", "run", "--model-profile", "fixture", "--cwd", str(tmp_path),
+            "--tools", "read", "--no-skills", "--system-prompt", "Inspect files and retain verified facts.",
+            "--task", "Inspect note ten times", "--max-turns", "15", "--keep-recent-tokens", "1200",
+            "--summary-max-tokens", "200", "--compaction-trigger-ratio", ".6", "--json",
+            "--trajectory-output", str(tmp_path / "trajectory.json")], cwd=Path(__file__).resolve().parents[1],
+            env=environment, capture_output=True, text=True, timeout=20)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["output"] == "verified"
+    assert summary_calls
+    assert all(body["max_tokens"] == 1000 for body in main_calls)
+    assert all(body["max_tokens"] == 200 for body in summary_calls)
+    assert "<context-summary>" in str(main_calls[-1]["messages"])
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["extra"]["context_budget"]["context_window"] == 8000
+    assert trajectory["extra"]["context_budget"]["window_source"] == "profile"
+    assert trajectory["extra"]["run_metrics"]["input_tokens"] == 100 * len(requests)
+    assert trajectory["extra"]["run_metrics"]["output_tokens"] == 20 * len(requests)
+    assert trajectory["extra"]["compaction"]["completed"] == len(summary_calls)
+
+
 @pytest.mark.parametrize("response", [
     payload({"content": "partial"}, "length"), payload({"content": "filtered"}, "content_filter"),
     payload({"content": "", "refusal": "refused"}), payload({"content": ""}),
@@ -128,6 +189,9 @@ def test_real_cli_http_model_reads_a_local_file(tmp_path):
             else:
                 result = payload({"tool_calls": [{"id": "read-note", "type": "function", "function": {
                     "name": "read", "arguments": '{"path":"note"}'}}]}, "tool_calls")
+            result["usage"] = {"prompt_tokens": 100 * len(requests),
+                               "completion_tokens": 10 * len(requests),
+                               "prompt_tokens_details": {"cached_tokens": 80 if len(requests) == 1 else 150}}
             data = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -141,7 +205,8 @@ def test_real_cli_http_model_reads_a_local_file(tmp_path):
     environment["AWORLD_API_KEY"] = "local-fixture-key"
     try:
         result = subprocess.run([sys.executable, "-m", "aworld", "run", "--model", "local-fixture", "--base-url",
-            f"http://127.0.0.1:{server.server_port}/v1", "--cwd", str(tmp_path), "--task", "read note", "--json"],
+            f"http://127.0.0.1:{server.server_port}/v1", "--cwd", str(tmp_path), "--task", "read note", "--json",
+            "--trajectory-output", str(tmp_path / "trajectory.json")],
             cwd=Path(__file__).resolve().parents[1], env=environment, capture_output=True, text=True, timeout=10)
     finally:
         server.shutdown()
@@ -150,6 +215,11 @@ def test_real_cli_http_model_reads_a_local_file(tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["output"] == "verified"
     assert len(requests) == 2
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["extra"]["token_usage"] == "reported"
+    metrics = trajectory["extra"]["run_metrics"]
+    assert (metrics["input_tokens"], metrics["output_tokens"], metrics["cache_read_tokens"], metrics["total_tokens"]) == (300, 30, 230, 330)
+    assert metrics["reported_calls"] == metrics["model_calls"] == 2
 
 
 def test_cli_ctrl_c_during_http_request_exits_and_cleans_up():
