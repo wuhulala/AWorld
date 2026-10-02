@@ -16,7 +16,7 @@ from typing import Mapping
 from uuid import uuid4
 
 from aworld._version import __version__
-from aworld.core.agent import Agent, load_skills
+from aworld.core.agent import Agent
 from aworld.core.agent.messages import AssistantMessage, ToolCall, ToolResultMessage
 from aworld.core.context import Context
 from aworld.core.sandbox import LocalSandbox
@@ -87,8 +87,12 @@ def parser():
     value.add_argument("--cwd", type=Path, default=Path.cwd(), help="LocalSandbox working directory")
     value.add_argument("--tools", help="Comma-separated capability names; replaces defaults")
     value.add_argument("--no-tools", action="store_true")
-    value.add_argument("--skill-path", action="append", default=[], help="Explicit local Skill root (requires aworld[skills])")
-    value.add_argument("--system-prompt", default="You are a helpful agent. Use available tools when needed.")
+    skill_args = value.add_mutually_exclusive_group()
+    skill_args.add_argument("--skill-path", action="append", default=[], help="Explicit Skill roots, replacing auto-discovery (requires aworld[skills])")
+    skill_args.add_argument("--no-skills", action="store_true", help="Disable Skill discovery")
+    value.add_argument("--work-root", type=Path, help="Session notes root (default: cwd/.aworld/sessions)")
+    value.add_argument("--network-policy", choices=["allowed", "disabled", "unknown"], default=os.getenv("AWORLD_NETWORK_POLICY", "unknown"))
+    value.add_argument("--system-prompt", default=None, help="Replace the default base prompt; workspace, Skill and runtime context still apply")
     value.add_argument("--max-turns", type=int, default=20)
     value.add_argument("--timeout", type=float, help="Total execution budget per run in seconds")
     value.add_argument("--request-timeout", type=float, default=60)
@@ -140,7 +144,12 @@ async def _host(args, command):
     if command == "tools":
         print(_json(registry.schemas()) if args.json else "\n".join(f"{tool.name}: {tool.description}" for tool in registry))
         return 0
-    skills = load_skills(*args.skill_path) if args.skill_path else ()
+    from aworld.cli.prompt import BASE_PROMPT, PROMPT_VERSION, discover_skills, workspace_prompt, runtime_prompt
+    skills = discover_skills(args.cwd, paths=args.skill_path, disabled=args.no_skills)
+    workspace, sources = workspace_prompt(args.cwd)
+    system_prompt = "\n\n".join(part for part in (BASE_PROMPT if args.system_prompt is None else args.system_prompt, workspace) if part)
+    sources = [{"kind": "base", "version": PROMPT_VERSION, "custom": args.system_prompt is not None}, *sources,
+               {"kind": "skills", "paths": [skill.location for skill in skills]}, {"kind": "runtime"}]
     if args.demo:
         model = DemoModel()
     else:
@@ -150,7 +159,8 @@ async def _host(args, command):
             timeout=args.request_timeout, reasoning_effort=args.reasoning_effort, max_retries=args.max_retries)
     sessions = InMemorySessionStore()
     try:
-        agent = Agent(model=model, tools=registry, skills=skills, system_prompt=args.system_prompt, max_turns=args.max_turns)
+        agent = Agent(model=model, tools=registry, skills=skills, system_prompt=system_prompt, max_turns=args.max_turns,
+                      runtime_prompt=runtime_prompt(args), prompt_metadata={"version": PROMPT_VERSION, "sources": sources})
         session = await create_session(agent=agent, context=Context(), store=sessions, metadata={"cwd": str(args.cwd.resolve())})
         initial = args.task if args.task is not None else args.prompt
         if initial is not None:

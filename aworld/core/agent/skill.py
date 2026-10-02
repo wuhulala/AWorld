@@ -35,7 +35,10 @@ class Skill:
         YAML parsing is optional and imported only for this explicit file loader.
         This method never installs dependencies, syncs assets, or executes scripts.
         """
-        import yaml
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ImportError("Skill discovery requires the optional aworld[skills] dependency; use --no-skills to disable it") from exc
 
         location = Path(path).expanduser().resolve()
         text = location.read_text(encoding="utf-8")

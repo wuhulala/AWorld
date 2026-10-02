@@ -72,6 +72,9 @@ class RunContext(Protocol):
     """Execution-scoped access, fenced once stopping begins or execution finishes."""
 
     @property
+    def remaining_seconds(self) -> float | None: ...
+
+    @property
     def run_id(self) -> str: ...
 
     @property

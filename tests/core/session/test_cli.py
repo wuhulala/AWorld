@@ -17,7 +17,7 @@ def command(*args, input=None):
         env.pop(key, None)
     return subprocess.run([sys.executable, "-I", "-S", "-c",
         "import sys; sys.path.insert(0, sys.argv.pop(1)); from aworld.cli.main import main; raise SystemExit(main())",
-        str(ROOT), *args], input=input, capture_output=True, text=True, env=env, timeout=10)
+        str(ROOT), *args, "--no-skills"], input=input, capture_output=True, text=True, env=env, timeout=10)
 
 
 class CliTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Agent + Context + Tool", result.stdout)
         self.assertEqual(result.stderr, "")
-        self.assertIn("1.0.0a2", command("--version").stdout)
+        self.assertIn("1.0.0a3", command("--version").stdout)
         tools = json.loads(command("tools", "--json").stdout)
         self.assertEqual([tool["name"] for tool in tools], ["read", "write", "bash", "read_session", "search_sessions", "session_query"])
 
@@ -65,8 +65,8 @@ class CliTests(unittest.TestCase):
             trajectory = json.loads((root / "trajectory.json").read_text())
             outcome = json.loads((root / "result.json").read_text())
             self.assertEqual(trajectory["session_id"], outcome["session_id"])
-            self.assertEqual([step["step_id"] for step in trajectory["steps"]], list(range(1, 6)))
-            step = trajectory["steps"][1]
+            self.assertEqual([step["step_id"] for step in trajectory["steps"]], list(range(1, len(trajectory["steps"]) + 1)))
+            step = next(step for step in trajectory["steps"] if step.get("tool_calls"))
             self.assertEqual(step["tool_calls"][0]["function_name"], "read")
             observation = step["observation"]["results"][0]
             self.assertEqual(observation["source_call_id"], step["tool_calls"][0]["tool_call_id"])

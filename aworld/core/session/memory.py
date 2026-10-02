@@ -167,6 +167,12 @@ class _ExecutionContext:
     def session_id(self) -> str:
         return self._run.session_id
 
+    @property
+    def remaining_seconds(self) -> float | None:
+        self._check()
+        deadline = self._run._deadline
+        return None if deadline is None else max(0.0, deadline.when() - asyncio.get_running_loop().time())
+
     def _check(self) -> None:
         run = self._run
         run._session._store._bind()

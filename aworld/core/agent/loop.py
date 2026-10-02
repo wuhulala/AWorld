@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from typing import Sequence
+from typing import Callable, Mapping, Sequence
+from hashlib import sha256
 
 from aworld.core.context.simple import ContextEntry
 from aworld.core.session.protocols import RunContext
@@ -65,6 +66,8 @@ class Agent:
         self, *, model: Model, tools: Sequence[Tool] | ToolRegistry | None = None,
         skills: Sequence[Skill] = (), system_prompt: str = "",
         max_turns: int = 20,
+        runtime_prompt: Callable[[RunContext, int], str] | None = None,
+        prompt_metadata: Mapping[str, object] | None = None,
     ) -> None:
         if not callable(getattr(model, "complete", None)):
             raise TypeError("model must implement async complete()")
@@ -92,6 +95,8 @@ class Agent:
         self._system_prompt = "\n\n".join(part for part in contributions if part)
         self._skills = skills
         self._max_turns = max_turns
+        self._runtime_prompt = runtime_prompt
+        self._prompt_metadata = deepcopy(dict(prompt_metadata)) if prompt_metadata is not None else None
 
     @property
     def tools(self) -> ToolRegistry:
@@ -114,8 +119,14 @@ class Agent:
             for entry in history:
                 if entry.kind == "assistant":
                     seen_calls.update(call["id"] for call in entry.data["tool_calls"])
+            system_prompt = self._system_prompt
+            if self._runtime_prompt is not None:
+                system_prompt += "\n\n" + self._runtime_prompt(context, turn)
+            if self._prompt_metadata is not None:
+                context.append("system", {**self._prompt_metadata, "content": system_prompt,
+                    "sha256": sha256(system_prompt.encode()).hexdigest(), "turn": turn})
             request = ModelRequest(
-                self._system_prompt, _messages(history),
+                system_prompt, _messages(history),
                 self._tools.schemas(),
             )
             context.emit("model.started", {"turn": turn})

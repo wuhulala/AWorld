@@ -25,7 +25,10 @@ def write_json(path, value, *, default=None):
 def build_trajectory(history, *, result, agent, model_name=None):
     steps, calls = [], {}
     for entry in history:
-        if entry.kind == "input":
+        if entry.kind == "system":
+            steps.append({"step_id": len(steps) + 1, "source": "system", "message": entry.data["content"],
+                          "extra": {"run_id": entry.run_id, **{key: value for key, value in entry.data.items() if key != "content"}}})
+        elif entry.kind == "input":
             steps.append({"step_id": len(steps) + 1, "source": "user", "message": entry.data,
                           "extra": {"run_id": entry.run_id}})
         elif entry.kind == "assistant":

@@ -42,6 +42,7 @@ only-include = [
     "aworld/checkpoint/inmemory.py",
     "aworld/cli/__init__.py",
     "aworld/cli/main.py",
+    "aworld/cli/prompt.py",
     "aworld/cli/trajectory.py",
     "aworld/config/__init__.py",
     "aworld/config/cl100k_base.tiktoken",
