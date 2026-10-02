@@ -45,6 +45,7 @@ def test_compiler_limit_env_and_cli_priority(tmp_path):
 
 
 def test_exact_registry_unknown_alias_and_default_profile(tmp_path):
+    assert settings(tmp_path, "--model", "matrixllm.aisearch_dsv41flash").context_window == 1000000
     assert settings(tmp_path, "--model", "gpt-4.1").context_window == 1047576
     assert settings(tmp_path, "--model", "external-custom").window_source == "core_fallback"
     assert settings(tmp_path, "--model", "external-custom").context_window == 128000
